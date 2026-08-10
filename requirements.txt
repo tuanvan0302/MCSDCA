@@ -1,0 +1,10 @@
+torch
+torchvision
+matplotlib
+numpy
+tqdm
+h5py
+hdf5plugin
+jupyterlab
+ipykernel
+stable-worldmodel[train,env]

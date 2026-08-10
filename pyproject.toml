@@ -1,0 +1,15 @@
+[project]
+name = "mcsdca-mnist-experiment"
+version = "0.1.0"
+description = "MNIST experiment comparing MCSDCA-odLD, MCSDCA-udLD, and Adam."
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.2",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "stable-worldmodel[env,train]>=0.1.1",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "tqdm>=4.70.0",
+]
