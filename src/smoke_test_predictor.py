@@ -1,12 +1,18 @@
+"""Fast CPU smoke test for the full-model MCSDCA training path.
+
+Exercises `predict_target`, `select_full_model_parameters`, one MCSDCA-odLD /
+MCSDCA-udLD outer step and one baseline step on a tiny LeWM-shaped model, and
+checks that every one of the five module groups is updated.
+"""
+
 from __future__ import annotations
 
-import copy
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,146 +20,100 @@ if str(ROOT) not in sys.path:
 
 from src.baselines import make_baseline_optimizer
 from src.lewm_predictor import (
-    freeze_encoder_side,
-    latent_rollout_stats,
-    one_step_predictor_loss,
-    rollout_predictor_loss,
-    select_dynamics_head_parameters,
+    LEWM_TRAINING_MODULES,
+    predict_target,
+    select_full_model_parameters,
 )
 from src.mcsdca import MCSDCAConfig, MCSDCAOdLD, MCSDCAUdLD
 
 
 class ToyLeWM(nn.Module):
-    """Small LeWM-like model used only for smoke testing."""
+    """Small LeWM-shaped model with all five trainable module groups."""
 
     def __init__(self, obs_dim: int = 8, action_dim: int = 3, emb_dim: int = 5):
         super().__init__()
         self.encoder = nn.Linear(obs_dim, emb_dim)
         self.projector = nn.Linear(emb_dim, emb_dim)
         self.action_encoder = nn.Linear(action_dim, emb_dim)
-        self.predictor = nn.Sequential(
-            nn.Linear(2 * emb_dim, 16),
-            nn.Tanh(),
-            nn.Linear(16, emb_dim),
-        )
+        self.predictor = nn.Sequential(nn.Linear(2 * emb_dim, 16), nn.Tanh(), nn.Linear(16, emb_dim))
         self.pred_proj = nn.Linear(emb_dim, emb_dim)
 
     def encode(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        pixels = info["pixels"].float()
-        action = info["action"].float()
-        emb = self.projector(self.encoder(pixels))
-        act_emb = self.action_encoder(action)
-        return {"emb": emb, "act_emb": act_emb}
+        emb = self.projector(self.encoder(info["pixels"].float()))
+        return {"emb": emb, "act_emb": self.action_encoder(info["action"].float())}
 
     def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
-        pred_in = torch.cat([emb, act_emb], dim=-1)
-        pred = self.predictor(pred_in)
-        return self.pred_proj(pred)
+        return self.pred_proj(self.predictor(torch.cat([emb, act_emb], dim=-1)))
 
 
 def make_batch(batch_size: int = 4, seq_len: int = 6, obs_dim: int = 8, action_dim: int = 3) -> dict[str, torch.Tensor]:
-    pixels = torch.randn(batch_size, seq_len, obs_dim)
     action = torch.randn(batch_size, seq_len, action_dim)
-    action[0, 0, 0] = float("nan")
-    return {"pixels": pixels, "action": action}
+    action[0, 0, 0] = float("nan")  # sequence-boundary NaN, must be sanitized
+    return {"pixels": torch.randn(batch_size, seq_len, obs_dim), "action": action}
 
 
 @torch.no_grad()
-def clone_state(module: nn.Module) -> dict[str, torch.Tensor]:
-    return {name: value.detach().clone() for name, value in module.state_dict().items()}
+def clone_state(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {name: value.detach().clone() for name, value in model.state_dict().items()}
 
 
-def assert_any_changed(before: dict[str, torch.Tensor], after: dict[str, torch.Tensor], prefix: str) -> None:
-    changed = [
-        name
-        for name, old_value in before.items()
-        if name.startswith(prefix) and not torch.allclose(old_value, after[name])
-    ]
-    if not changed:
-        raise AssertionError(f"Expected parameters under '{prefix}' to change.")
+def assert_every_module_changed(before: dict[str, torch.Tensor], after: dict[str, torch.Tensor]) -> None:
+    for module in LEWM_TRAINING_MODULES:
+        changed = any(
+            name.startswith(module + ".") and not torch.allclose(value, after[name])
+            for name, value in before.items()
+        )
+        if not changed:
+            raise AssertionError(f"Expected parameters under '{module}' to change.")
 
 
-def assert_all_same(before: dict[str, torch.Tensor], after: dict[str, torch.Tensor], prefixes: tuple[str, ...]) -> None:
-    for name, old_value in before.items():
-        if name.startswith(prefixes) and not torch.allclose(old_value, after[name]):
-            raise AssertionError(f"Expected frozen parameter '{name}' to stay unchanged.")
+def loss_closure(model: nn.Module, batch: dict[str, torch.Tensor]):
+    def _loss() -> torch.Tensor:
+        pred, target, _ = predict_target(model, batch, history_size=3, num_preds=1)
+        return F.mse_loss(pred, target)
+
+    return _loss
 
 
-def check_losses() -> None:
+def check_predict_target() -> None:
     torch.manual_seed(0)
     model = ToyLeWM()
-    batch = make_batch()
-
-    one_step = one_step_predictor_loss(model, batch, history_size=3, num_preds=1)
-    rollout = rollout_predictor_loss(model, batch, history_size=3, horizon=2, discount=0.8)
-    stats = latent_rollout_stats(model, batch, history_size=3, horizon=2)
-
-    if one_step.ndim != 0 or not torch.isfinite(one_step):
-        raise AssertionError("one_step_predictor_loss must return a finite scalar.")
-    if rollout.ndim != 0 or not torch.isfinite(rollout):
-        raise AssertionError("rollout_predictor_loss must return a finite scalar.")
-    if not all(torch.isfinite(torch.tensor(value)) for value in stats.values()):
-        raise AssertionError("latent_rollout_stats must return finite values.")
+    pred, target, emb = predict_target(model, make_batch(), history_size=3, num_preds=1)
+    if pred.shape != target.shape or pred.shape[1] != 3:
+        raise AssertionError(f"unexpected shapes: pred={tuple(pred.shape)} target={tuple(target.shape)}")
+    if emb.shape[1] != 6:
+        raise AssertionError("emb should keep the full sequence length for SIGReg reuse.")
+    if not torch.isfinite(F.mse_loss(pred, target)):
+        raise AssertionError("prediction loss is not finite.")
 
 
-def check_mcsdca_odld() -> None:
+def check_mcsdca(optimizer_cls, **cfg_kwargs) -> None:
     torch.manual_seed(1)
     model = ToyLeWM()
-    freeze_encoder_side(model)
     batch = make_batch()
-    params = select_dynamics_head_parameters(model)
     before = clone_state(model)
-
-    optimizer = MCSDCAOdLD(
-        params,
-        MCSDCAConfig(langevin_steps=3, langevin_steps_power=1.0, burn_in=1, od_eta=1e-2, epsilon=1e-8),
+    optimizer = optimizer_cls(
+        select_full_model_parameters(model),
+        MCSDCAConfig(langevin_steps=3, langevin_steps_power=1.0, max_langevin_steps=None, burn_in=1, **cfg_kwargs),
     )
-    info = optimizer.step(lambda: one_step_predictor_loss(model, batch, history_size=3, num_preds=1))
-
-    if info["backprop_calls"] != 3:
-        raise AssertionError("MCSDCA-odLD should report three backprop calls.")
-    if info["markov_chain_length"] != 4 or info["retained_samples"] != 3:
-        raise AssertionError("MCSDCA-odLD should use scheduled Markov-chain length.")
-
-    info = optimizer.step(lambda: one_step_predictor_loss(model, batch, history_size=3, num_preds=1))
-    after = clone_state(model)
-
-    if info["backprop_calls"] != 7:
-        raise AssertionError("MCSDCA-odLD should accumulate scheduled backprop calls.")
-    if info["markov_chain_length"] != 5 or info["retained_samples"] != 4:
-        raise AssertionError("MCSDCA-odLD should grow Markov-chain length over time.")
-    assert_any_changed(before, after, "predictor")
-    assert_all_same(before, after, ("encoder", "projector"))
+    info = optimizer.step(loss_closure(model, batch))
+    if info["backprop_calls"] != 3 or info["markov_chain_length"] != 4 or info["retained_samples"] != 3:
+        raise AssertionError(f"unexpected chain accounting: {info}")
+    info = optimizer.step(loss_closure(model, batch))
+    if info["backprop_calls"] != 7 or info["markov_chain_length"] != 5:
+        raise AssertionError(f"chain length should grow over outer steps: {info}")
+    assert_every_module_changed(before, clone_state(model))
 
 
-def check_mcsdca_udld() -> None:
-    torch.manual_seed(2)
-    model = ToyLeWM()
-    freeze_encoder_side(model)
-    batch = make_batch()
-    params = select_dynamics_head_parameters(model)
-    before = clone_state(model)
+def check_beta0_resolution() -> None:
+    from src.mcsdca.param_utils import resolve_base_gamma
 
-    optimizer = MCSDCAUdLD(
-        params,
-        MCSDCAConfig(langevin_steps=3, langevin_steps_power=1.0, burn_in=1, ud_delta=0.1, epsilon=1e-8),
-    )
-    info = optimizer.step(lambda: one_step_predictor_loss(model, batch, history_size=3, num_preds=1))
-
-    if info["backprop_calls"] != 3:
-        raise AssertionError("MCSDCA-udLD should report three backprop calls.")
-    if info["markov_chain_length"] != 4 or info["retained_samples"] != 3:
-        raise AssertionError("MCSDCA-udLD should use scheduled Markov-chain length.")
-
-    info = optimizer.step(lambda: one_step_predictor_loss(model, batch, history_size=3, num_preds=1))
-    after = clone_state(model)
-
-    if info["backprop_calls"] != 7:
-        raise AssertionError("MCSDCA-udLD should accumulate scheduled backprop calls.")
-    if info["markov_chain_length"] != 5 or info["retained_samples"] != 4:
-        raise AssertionError("MCSDCA-udLD should grow Markov-chain length over time.")
-    assert_any_changed(before, after, "predictor")
-    assert_all_same(before, after, ("encoder", "projector"))
+    cfg = MCSDCAConfig(beta0=0.9, local_entropy_time=1e4)
+    gamma0 = resolve_base_gamma(cfg)
+    if not abs(gamma0 - (1.0 / 0.9 - 1.0) / 1e4) < 1e-12:
+        raise AssertionError(f"resolve_base_gamma wrong: {gamma0}")
+    if abs(resolve_base_gamma(MCSDCAConfig()) - MCSDCAConfig().gamma) > 0:
+        raise AssertionError("resolve_base_gamma should fall back to cfg.gamma when beta0 is None.")
 
 
 def check_baselines() -> None:
@@ -161,43 +121,32 @@ def check_baselines() -> None:
     for name in ("AdamW", "Adam", "SGD + momentum", "RMSprop", "Adagrad"):
         torch.manual_seed(3)
         model = ToyLeWM()
-        freeze_encoder_side(model)
-        params = select_dynamics_head_parameters(model)
+        params = select_full_model_parameters(model)
         before = clone_state(model)
-        optimizer = make_baseline_optimizer(name, params, lr=1e-3, weight_decay=0.0)
-
+        optimizer = make_baseline_optimizer(name, params, lr=1e-2, weight_decay=0.0)
         optimizer.zero_grad(set_to_none=True)
-        loss = one_step_predictor_loss(model, batch, history_size=3, num_preds=1)
-        loss.backward()
+        loss_closure(model, batch)().backward()
         optimizer.step()
-
-        after = clone_state(model)
-        assert_any_changed(before, after, "predictor")
-        assert_all_same(before, after, ("encoder", "projector"))
+        assert_every_module_changed(before, clone_state(model))
 
 
 def check_invalid_config() -> None:
-    try:
-        MCSDCAConfig(langevin_steps=2, burn_in=3).validate()
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Invalid MCSDCAConfig should raise ValueError.")
-
-    try:
-        MCSDCAConfig(gamma_power=1.0).validate()
-    except ValueError:
-        return
-    raise AssertionError("Invalid MCSDCAConfig should raise ValueError.")
+    for kwargs in ({"langevin_steps": 2, "burn_in": 3}, {"gamma_power": 1.0}, {"beta0": 1.5}):
+        try:
+            MCSDCAConfig(**kwargs).validate()
+        except ValueError:
+            continue
+        raise AssertionError(f"MCSDCAConfig({kwargs}) should have raised ValueError.")
 
 
 def main() -> None:
-    check_losses()
-    check_mcsdca_odld()
-    check_mcsdca_udld()
+    check_predict_target()
+    check_mcsdca(MCSDCAOdLD, od_eta=1e-2, epsilon=1e-8)
+    check_mcsdca(MCSDCAUdLD, ud_delta=0.1, epsilon=1e-8)
+    check_beta0_resolution()
     check_baselines()
     check_invalid_config()
-    print("Predictor MCSDCA smoke test passed.")
+    print("Full-model MCSDCA smoke test passed.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+# PushT data-scaling ablation. Everything is held fixed except data_fraction;
+# `budget` is the SAME backprop budget at every fraction (so smaller fractions
+# just get more passes over less data). Fill the MCSDCA overrides from the
+# sweep Stage-3 / Stage-4 winners and the AdamW lr/wd from baseline_adamw.
+profile: small
+device: auto
+budget: 5000                       # <-- fixed backprop budget, identical at every fraction
+fractions: [0.1, 0.25, 0.5, 1.0]
+seeds: [3072, 3073, 3074]
+output: outputs/ablation
+optimizers:
+  AdamW:
+    lr: 5.0e-5
+    weight_decay: 1.0e-3
+  MCSDCA-odLD:
+    mcsdca_eta: 3.0e-3              # <-- sweep Stage-3 winner
+    mcsdca_epsilon: 1.0e-8
+    mcsdca_beta0: 0.9
+  MCSDCA-udLD:
+    mcsdca_delta: 0.1              # <-- sweep Stage-4 winner
+    mcsdca_epsilon: 1.0e-8
+    mcsdca_beta0: 0.9

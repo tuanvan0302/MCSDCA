@@ -1,5 +1,15 @@
 ﻿# Thí nghiệm 1: Dùng MCSDCA như optimizer cho predictor của LeWM
 
+> **Cập nhật cài đặt (2026-08-31):** implementation hiện tại **train full-model joint
+> from scratch** (cả 5 module `encoder/projector/action_encoder/predictor/pred_proj`),
+> không còn "predictor-only / đóng băng encoder" như mô tả ở §II.4.2 và §II.4.4 bên dưới.
+> Mọi optimizer được so sánh trên trục `backprop_calls` với **cùng backprop budget**
+> (fresh minibatch mỗi bước Langevin, theo đúng Algorithm 2/3). `epsilon` và `beta0`
+> (trọng số trộn DCA ngoài) là tham số được **tune** (grid `epsilon ∈ {1e-8,1e-4,1e-2}`,
+> `beta0 ∈ {0.5,0.9,0.99}`); phần lý thuyết bên dưới vẫn giữ nguyên. Đánh giá chính là
+> **data-scaling ablation trên PushT** (`data_fraction ∈ {0.1,0.25,0.5,1.0}`, fixed
+> compute budget). Docs chi tiết sẽ được cập nhật sau.
+
 ## I. Cơ sở lý thuyết MCSDCA
 
 ### 1. Từ bài toán tối ưu đến quy hoạch DC

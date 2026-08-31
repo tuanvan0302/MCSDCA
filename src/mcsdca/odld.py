@@ -16,6 +16,7 @@ from .param_utils import (
     finite_or_raise,
     gamma_at_step,
     markov_chain_length_at_step,
+    resolve_base_gamma,
     trainable_parameters,
     zero_like,
 )
@@ -56,6 +57,8 @@ class MCSDCAOdLD:
             cfg.langevin_steps_power,
             self.outer_step,
         )
+        if cfg.max_langevin_steps is not None:
+            chain_length = min(chain_length, cfg.max_langevin_steps)
 
         if cfg.burn_in == 0:
             for total, value in zip(y_k_sum, chain, strict=True):
@@ -92,7 +95,7 @@ class MCSDCAOdLD:
         if sample_count <= 0:
             raise ValueError("MCSDCA retained no Markov-chain samples. Check burn_in and chain length.")
         y_k = [total / float(sample_count) for total in y_k_sum]
-        gamma_k = gamma_at_step(cfg.gamma, cfg.gamma_power, self.outer_step)
+        gamma_k = gamma_at_step(resolve_base_gamma(cfg), cfg.gamma_power, self.outer_step)
         updated = dca_closed_form_update(base, y_k, gamma_k, cfg.local_entropy_time)
         assign_params(self.params, updated)
         self.zero_grad()

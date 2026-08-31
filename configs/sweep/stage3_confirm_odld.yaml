@@ -1,0 +1,13 @@
+# Stage 3 - confirm the odLD winner across 3 seeds (full `small` budget).
+# Replace the single-value grid entries with the Stage-2 winner.
+base:
+  training_profile: small
+  data_fraction: 0.10
+  optimizers: MCSDCA-odLD
+  device: auto
+grid:
+  seed: [3072, 3073, 3074]
+  mcsdca_eta: [3.0e-3]      # <-- Stage-2 winner
+  mcsdca_epsilon: [1.0e-8]  # <-- Stage-2 winner
+  mcsdca_beta0: [0.9]       # <-- Stage-2 winner
+output: outputs/sweep/stage3_confirm_odld

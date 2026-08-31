@@ -1,0 +1,13 @@
+# Stage 4 - udLD. Inherit epsilon / beta0 from the odLD winner, sweep only the
+# underdamped step size delta. 1 seed to pick, then rerun with seed: [3072,3073,3074].
+base:
+  training_profile: small
+  data_fraction: 0.10
+  optimizers: MCSDCA-udLD
+  device: auto
+  seed: 3072
+  mcsdca_epsilon: 1.0e-8    # <-- odLD winner
+  mcsdca_beta0: 0.9         # <-- odLD winner
+grid:
+  mcsdca_delta: [0.03, 0.1, 0.3]
+output: outputs/sweep/stage4_udld

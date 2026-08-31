@@ -1,0 +1,87 @@
+[Cập nhật 2026-08-31] Code hiện train full-model joint from scratch (cả 5 module),
+KHÔNG còn predictor-only/đóng băng encoder như phần 4 bên dưới. So sánh trên trục
+backprop_calls với cùng backprop budget, fresh minibatch mỗi bước Langevin. epsilon
+và beta0 là tham số tune. Đánh giá = data-scaling ablation trên PushT.
+
+1. Một chút bối cảnh hàm Predictor của LeWM
+Trong LeWM, pipeline liên quan tới predictor có thể được miêu tả ngắn gọn như sau: Huấn luyện predictor -> Rollout bằng predictor -> CEM tối ưu chuỗi action.
++ Encoder tạo latent z_t 
++ Predictor dự đoán latent kế tiếp z_t+1_hat
++ Target latent: z_t+1
++ Hàm loss của predictor cơ bản (MSE): L_pred = (z_t+1 - z_t+1_hat)^2
++ Hàm loss tổng: L = L_pred + lambda * sigreg(z)
+
+2. Vì sao có thể áp dụng được thuật toán MCSDCA vào training predictor?
+Muốn áp dụng được thuật toán MCSDCA thì phải trả lời những câu hỏi sau:
++ Hàm mục tiêu có không lồi không ? 
++ Hàm mục tiêu không trơn hoặc không trơn từng phần ?
++ Hàm mục tiêu có tính ngẫu nhiên không 
++ Dữ liệu có tính Markov hoặc không i.i.d không ?
++ Có thể đưa bài toán về dạng DC không ?
+
+$$
+L_{pred}(\theta,\phi)
+=
+\lVert predictor_\phi(encoder_\theta(o_t), a_t)
+- encoder_\theta(o_{t+1}) \rVert^2
+$$
+
+Hàm mục tiêu:
+$$
+f(x)
+=
+L_{pred}(\theta,\phi)
++ \lambda SIGReg(Z_\theta)
+$$
+
+θ: Toàn bộ tham số mạng của encoder
+ϕ: Toàn bộ tham số mạng của predictor
+
+** Chứng minh là hàm không lồi 
+Mà 2 hàm này đều là neural networks có các tầng tuyến tính cũng có các hàm kích hoạt tạo (activation), normalization tạo nên một tổ hợp phi tuyến. Đối với predictor còn được rollout nhiều bước khiến nó còn mang nhiều tính phi tuyến hơn.
+=> Hàm mục tiêu f(x) là không lồi 
+
+** Chưa thể kết luận được tính không trơn hoặc không trơn từng phần của hàm mục tiêu
+
+** Hàm mục tiêu là ngẫu nhiên 
+Quá trình training sử dụng mini-batch với batch_size = 128, chứng tỏ gradient có tính ngẫu nhiên => Hàm mục tiêu có tính ngẫu nhiên 
+
+** Dữ liệu training có tính Markov và không i.i.dạng
+Trong LeWM, dữ liệu có dạng chuỗi $$\tau = (o_0,a_0,o_1,a_1,\ldots,o_T)$$ và $$o_{t+1} \sim P(o_{t+1} \mid o_t, a_t)$$. Điều này cho thấy observation kế tiếp không được lấy độc lập mà phụ thuộc vào observation hiện tại + hành động hiện tại. Vì vậy dữ liệu không phải là dạng i.i.d. 
+Nếu coi 1 transaction là $$X_t = (o_t, a_t, o_t+1)$$, $$X_t+1 = (o_t+1, a_t+1, o_t+2)$$, 2 sample này không độc lập vì có cùng o_t+1.
+Bên trên là đang lập luận theo góc nhìn đối với observation, còn thực tế là ở trong không gian latent, lập luận cũng hoàn toàn giống như vậy.
+
+=> Đây là điều quan trọng nhất để có thể áp dụng được thuật toán MCSDCA, vì thuật toán này đặc biệt áp dụng cho tình huống không lấy được mẫu i.i.d.
+
+** Đưa hàm mục tiêu về dạng DC
+Ý tưởng giống như trong bài báo gốc của thuật toán MCSDCA, ta sẽ không tối ưu trực tiếp hàm mục tiêu f(x), thay vào đó ta sẽ tối ưu phiên bản làm mịn của hàm f(x) được sinh vởi PDE regularization (phương trình đạo hàm riêng) được viết thành dạng DC, dùng Langevin dynamics để ước lượng thành phần của subgradient H, rồi giải bài toán con DCA.
+
+3. Tóm tắt lại kiến thức về thuật toán MCSDCA
+3.1. Langevin dynamics
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+4. Bản thử nghiệm thứ nhất: Dùng thuật toán MCSDCA như optimizer riêng cho predictor
+Ý tưởng phương pháp này là ta sẽ đóng băng encoder, train predictor bằng MCSDCA.
+Ưu điểm:
++ Ít can thiệp vào kiến trúc LeWM 
++ Dễ so sánh với Adam hay SGD, vì sử dụng thuật toán như một optimizer 
++ Dễ đo hiệu quả bằng one-step latent MSE và rollout latent 
+
+Cụ thể áp dụng
+
+
+

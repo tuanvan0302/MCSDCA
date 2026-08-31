@@ -1,0 +1,18 @@
+# Stage 1 - coarse odLD sweep (GPU). 3 x 3 x 3 = 27 points, 1 seed, PushT 10%.
+# LR_eff ~= beta0 * (n_k/2) * eta, so eta/beta0 are partly redundant - the grid
+# maps their interaction plus the epsilon (Langevin noise) regime.
+# Set --backprop-budget to ~25% of the `small` full budget for your hardware
+# (small full budget = steps_per_epoch * 10; print it with a 1-step dry run).
+# Rank afterwards:  uv run python src/sweep.py configs/sweep/stage1_odld.yaml --select-only
+base:
+  training_profile: small
+  data_fraction: 0.10
+  optimizers: MCSDCA-odLD
+  backprop_budget: 14000        # <-- tune to hardware (~25% of small full budget)
+  device: auto
+  seed: 3072
+grid:
+  mcsdca_eta: [1.0e-3, 3.0e-3, 1.0e-2]
+  mcsdca_epsilon: [1.0e-8, 1.0e-4, 1.0e-2]
+  mcsdca_beta0: [0.5, 0.9, 0.99]
+output: outputs/sweep/stage1_odld

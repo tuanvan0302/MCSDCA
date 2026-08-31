@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "MNIST experiment comparing MCSDCA-odLD, MCSDCA-udLD, and Adam."
 requires-python = ">=3.12"
 dependencies = [
+    "h5py>=3.16.0",
+    "hdf5plugin>=7.0.0",
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.2",
     "matplotlib>=3.11.1",
@@ -13,3 +15,12 @@ dependencies = [
     "torchvision>=0.28.0",
     "tqdm>=4.70.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true          # chỉ dùng index này cho gói được trỏ ở [tool.uv.sources]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }

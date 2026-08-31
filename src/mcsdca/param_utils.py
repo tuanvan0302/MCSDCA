@@ -56,6 +56,19 @@ def dca_closed_form_update(
     return [alpha * base_value + beta * y_value for base_value, y_value in zip(base, y, strict=True)]
 
 
+def resolve_base_gamma(config) -> float:
+    """Base proximal coefficient gamma_0 for the DCA outer step.
+
+    When ``config.beta0`` is set it is the target initial DCA mixing weight
+    ``beta = 1/(1 + t*gamma_0)`` (fraction of ``y_k`` in ``x_{k+1}``), so
+    ``gamma_0 = (1/beta0 - 1) / t``. Otherwise ``config.gamma`` is used directly.
+    """
+
+    if getattr(config, "beta0", None) is not None:
+        return (1.0 / config.beta0 - 1.0) / config.local_entropy_time
+    return config.gamma
+
+
 def gamma_at_step(gamma: float, gamma_power: float, outer_step: int) -> float:
     return gamma * float(outer_step + 1) ** gamma_power
 
