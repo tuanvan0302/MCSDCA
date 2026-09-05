@@ -289,6 +289,10 @@ def build_parser_e1() -> argparse.ArgumentParser:
     p.add_argument("--sigreg-num-proj", type=int, default=512)
     p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--window-cache", choices=("auto", "gpu", "cpu", "off"), default="auto",
+                   help="Resident decoded-window cache: auto picks GPU/CPU-RAM by size, else streams from HDF5.")
+    p.add_argument("--cache-max-gb", type=float, default=12.0, help="GPU VRAM budget for the window cache.")
+    p.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
     p.add_argument("--tune-budget", type=int, default=None, help="Backprop budget per sweep point (default 3000, flow 60).")
     p.add_argument("--eval-budget", type=int, default=None,
                    help="FIXED backprop budget for the final comparison, same at every fraction (default 8000, flow 120).")
@@ -327,6 +331,9 @@ def main() -> None:
         "precision": args.precision,
         "batch_size": args.batch_size,
         "sigreg_num_proj": args.sigreg_num_proj,
+        "window_cache": args.window_cache,
+        "cache_max_gb": args.cache_max_gb,
+        "cache_ram_gb": args.cache_ram_gb,
     }
 
     try:

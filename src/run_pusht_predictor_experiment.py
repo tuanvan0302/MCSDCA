@@ -13,16 +13,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -244,11 +246,17 @@ class PushTHDF5Sampler:
         self.seed = seed
         self.raw_span = frameskip * max_seq_len
 
-        with self.h5py.File(path, "r") as h5:
-            self.ep_len = np.asarray(h5["ep_len"][:])
-            self.ep_offset = np.asarray(h5["ep_offset"][:])
-            self.pixel_shape = tuple(h5["pixels"].shape)
-            self.action_shape = tuple(h5["action"].shape)
+        # One long-lived read handle (a bigger chunk cache than the default 1 MB
+        # so repeated slab reads during cache warm-up stay in memory). The
+        # ``action`` dataset is tiny (~19 MB) so we pull it fully into RAM once;
+        # every per-window action slice is then a pure numpy view.
+        self._h5 = self.h5py.File(path, "r", rdcc_nbytes=256 * 1024 * 1024)
+        self._pixels_ds = self._h5["pixels"]
+        self.ep_len = np.asarray(self._h5["ep_len"][:])
+        self.ep_offset = np.asarray(self._h5["ep_offset"][:])
+        self.pixel_shape = tuple(self._h5["pixels"].shape)
+        self.action_shape = tuple(self._h5["action"].shape)
+        self._actions_all = np.asarray(self._h5["action"][:], dtype=np.float32)
 
         self.valid_eps = np.flatnonzero(self.ep_len >= self.raw_span)
         if len(self.valid_eps) < 2:
@@ -266,18 +274,30 @@ class PushTHDF5Sampler:
             return self.val_eps
         raise ValueError("split must be 'train' or 'val'.")
 
+    def close(self) -> None:
+        handle = getattr(self, "_h5", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001 - best effort on teardown
+                pass
+            self._h5 = None
+
+    def __del__(self) -> None:
+        self.close()
+
     def _estimate_action_block_stats(self, sample_count: int) -> tuple[torch.Tensor, torch.Tensor]:
         rng = np.random.default_rng(self.seed + 11)
-        blocks: list[np.ndarray] = []
-        with self.h5py.File(self.path, "r") as h5:
-            action = h5["action"]
-            for _ in range(max(1, sample_count)):
-                ep = int(rng.choice(self.train_eps))
-                hi = int(self.ep_len[ep] - self.frameskip)
-                rel = int(rng.integers(0, hi + 1)) if hi > 0 else 0
-                start = int(self.ep_offset[ep] + rel)
-                blocks.append(np.asarray(action[start : start + self.frameskip]))
-        values = torch.from_numpy(np.concatenate(blocks, axis=0)).float()
+        # ``_actions_all`` is already resident; sample block start offsets and
+        # gather with fancy indexing instead of thousands of h5py reads.
+        starts: list[int] = []
+        for _ in range(max(1, sample_count)):
+            ep = int(rng.choice(self.train_eps))
+            hi = int(self.ep_len[ep] - self.frameskip)
+            rel = int(rng.integers(0, hi + 1)) if hi > 0 else 0
+            starts.append(int(self.ep_offset[ep] + rel))
+        idx = np.asarray(starts, dtype=np.int64)[:, None] + np.arange(self.frameskip, dtype=np.int64)[None, :]
+        values = torch.from_numpy(self._actions_all[idx.reshape(-1)]).float()
         values = values[~torch.isnan(values).any(dim=1)]
         return values.mean(dim=0), values.std(dim=0).clamp_min(1e-6)
 
@@ -319,32 +339,98 @@ class PushTHDF5Sampler:
             windows.append((ep, start, start + raw_span, int(self.ep_len[ep])))
         return windows
 
+    def _normalize_actions(self, raw: np.ndarray, seq_len: int) -> torch.Tensor:
+        """``raw`` is ``[N, seq_len * frameskip, A]`` -> ``[N, seq_len, frameskip*A]``
+        normalized exactly as the original ``_load_windows`` did."""
+
+        n, a = raw.shape[0], raw.shape[-1]
+        act = torch.from_numpy(np.ascontiguousarray(raw)).float().view(n, seq_len, self.frameskip, a)
+        act = (act - self.action_mean.view(1, 1, 1, -1)) / self.action_std.view(1, 1, 1, -1)
+        return torch.nan_to_num(act.flatten(start_dim=2), 0.0)
+
     def _load_windows(self, windows: list[tuple[int, int, int, int]], seq_len: int):
+        pixels_ds = self._pixels_ds
         pixels: list[np.ndarray] = []
-        actions: list[np.ndarray] = []
+        action_starts: list[int] = []
         rows: list[dict[str, int]] = []
-        with self.h5py.File(self.path, "r") as h5:
-            pixels_ds = h5["pixels"]
-            action_ds = h5["action"]
-            for ep, start, stop, ep_len in windows:
-                obs_indices = start + np.arange(seq_len) * self.frameskip
-                action_blocks = [
-                    np.asarray(action_ds[start + idx * self.frameskip : start + (idx + 1) * self.frameskip])
-                    for idx in range(seq_len)
-                ]
-                pixels.append(np.asarray(pixels_ds[obs_indices]))
-                actions.append(np.stack(action_blocks))
-                rows.append({"episode": ep, "raw_start": start, "raw_stop": stop, "episode_len": ep_len})
+        raw_span = self.frameskip * seq_len
+        for ep, start, stop, ep_len in windows:
+            obs_indices = start + np.arange(seq_len) * self.frameskip
+            pixels.append(np.asarray(pixels_ds[obs_indices]))
+            action_starts.append(start)
+            rows.append({"episode": ep, "raw_start": start, "raw_stop": stop, "episode_len": ep_len})
 
         pixel_tensor = torch.from_numpy(np.stack(pixels)).permute(0, 1, 4, 2, 3).float() / 255.0
         pixel_tensor = (pixel_tensor - IMAGE_MEAN) / IMAGE_STD
-        action_tensor = torch.from_numpy(np.stack(actions)).float()
-        action_tensor = (action_tensor - self.action_mean.view(1, 1, 1, -1)) / self.action_std.view(1, 1, 1, -1)
-        action_tensor = torch.nan_to_num(action_tensor.flatten(start_dim=2), 0.0)
+        gather = np.asarray(action_starts, dtype=np.int64)[:, None] + np.arange(raw_span, dtype=np.int64)[None, :]
+        action_tensor = self._normalize_actions(self._actions_all[gather], seq_len)
         return {"pixels": pixel_tensor, "action": action_tensor}, rows
 
     def window_batch(self, window_ids: np.ndarray, split: str, seq_len: int):
         return self._load_windows(self._resolve_windows(split, seq_len, window_ids), seq_len)
+
+    # ------------------------------------------------------------------ #
+    # Resident-cache construction (see WindowCache)                      #
+    # ------------------------------------------------------------------ #
+    def _window_frame_ids(self, windows: list[tuple[int, int, int, int]], seq_len: int) -> np.ndarray:
+        """``[N, seq_len]`` global pixel-frame indices for a resolved window list."""
+
+        starts = np.fromiter((w[1] for w in windows), dtype=np.int64, count=len(windows))
+        return starts[:, None] + np.arange(seq_len, dtype=np.int64)[None, :] * self.frameskip
+
+    def count_unique_frames(self, split: str, seq_len: int, window_ids: np.ndarray) -> int:
+        windows = self._resolve_windows(split, seq_len, window_ids)
+        return int(np.unique(self._window_frame_ids(windows, seq_len)).size)
+
+    def materialize_windows(
+        self,
+        split: str,
+        seq_len: int,
+        window_ids: np.ndarray,
+        frames_device: torch.device,
+        compute_device: torch.device,
+        read_chunk: int = 1024,
+    ) -> "WindowCache":
+        """Decode every requested window once and keep it resident.
+
+        Unique frames are read from HDF5 in contiguous runs and written slab by
+        slab straight into the destination ``[F, C, H, W] uint8`` tensor on
+        ``frames_device`` (no full-size intermediate copy). Per-batch gathering +
+        float normalization then happens on ``compute_device`` with no further
+        disk access.
+        """
+
+        windows = self._resolve_windows(split, seq_len, window_ids)
+        frame_ids = self._window_frame_ids(windows, seq_len)  # [N, seq_len]
+        uniq = np.unique(frame_ids)
+        _, height, width, channels = self.pixel_shape
+
+        frames_t = torch.empty((uniq.size, channels, height, width), dtype=torch.uint8, device=frames_device)
+        boundaries = np.flatnonzero(np.diff(uniq) != 1)
+        run_edges = np.concatenate(([0], boundaries + 1, [uniq.size]))
+        for lo_pos, hi_pos in zip(run_edges[:-1], run_edges[1:], strict=True):
+            first = int(uniq[lo_pos])  # run is fully contiguous: uniq[lo_pos:hi_pos] == first + arange(...)
+            for sub in range(int(lo_pos), int(hi_pos), read_chunk):
+                sub_hi = min(sub + read_chunk, int(hi_pos))
+                slab = self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
+                frames_t[sub:sub_hi] = torch.from_numpy(np.ascontiguousarray(slab)).permute(0, 3, 1, 2)
+
+        local_rows = np.searchsorted(uniq, frame_ids).astype(np.int64)  # [N, seq_len]
+
+        raw_span = self.frameskip * seq_len
+        action_gather = (
+            np.fromiter((w[1] for w in windows), dtype=np.int64, count=len(windows))[:, None]
+            + np.arange(raw_span, dtype=np.int64)[None, :]
+        )
+        window_actions = self._normalize_actions(self._actions_all[action_gather], seq_len)
+
+        return WindowCache(
+            frames_u8=frames_t,
+            window_frame_rows=torch.from_numpy(local_rows).to(frames_device),
+            window_actions=window_actions.to(compute_device),
+            seq_len=seq_len,
+            compute_device=compute_device,
+        )
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -362,31 +448,147 @@ class PushTHDF5Sampler:
         }
 
 
-def batch_for_model(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    device = next(model.parameters()).device
-    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+@dataclass(eq=False)
+class WindowCache:
+    """Every sequence window for one split, decoded once and kept resident.
+
+    ``frames_u8`` holds only the *unique* pixel frames (``uint8``) referenced by
+    the windows, on ``frames_device`` (GPU when it fits, else CPU RAM).
+    ``window_frame_rows[i]`` gathers window ``i``'s ``seq_len`` frames out of it.
+    ``take()`` produces a model-ready, float-normalized batch on
+    ``compute_device`` with zero disk access.
+    """
+
+    frames_u8: torch.Tensor          # [F, C, H, W] uint8
+    window_frame_rows: torch.Tensor  # [N, seq_len] int64, indices into frames_u8
+    window_actions: torch.Tensor     # [N, seq_len, frameskip*A] float32
+    seq_len: int
+    compute_device: torch.device
+
+    def __post_init__(self) -> None:
+        mean = IMAGE_MEAN.to(self.compute_device, dtype=torch.float32)
+        std = IMAGE_STD.to(self.compute_device, dtype=torch.float32)
+        self._mean = mean
+        self._std = std
+        self._frame_shape = tuple(self.frames_u8.shape[1:])  # (C, H, W)
+
+    def __len__(self) -> int:
+        return self.window_frame_rows.shape[0]
+
+    def nbytes(self) -> int:
+        return (
+            self.frames_u8.element_size() * self.frames_u8.nelement()
+            + self.window_frame_rows.element_size() * self.window_frame_rows.nelement()
+            + self.window_actions.element_size() * self.window_actions.nelement()
+        )
+
+    def take(self, idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        """A ``{'pixels', 'action'}`` batch for the given window rows."""
+
+        idx = idx.to(self.window_frame_rows.device, dtype=torch.long)
+        batch = idx.shape[0]
+        rows = self.window_frame_rows.index_select(0, idx).reshape(-1)  # [batch*seq_len]
+        frames = self.frames_u8.index_select(0, rows)                    # [batch*seq_len, C, H, W] uint8
+        pixels = frames.to(self.compute_device, non_blocking=True).reshape(batch, self.seq_len, *self._frame_shape)
+        pixels = pixels.float().div_(255.0).sub_(self._mean).div_(self._std)
+        action = self.window_actions.index_select(0, idx.to(self.window_actions.device))
+        return {"pixels": pixels, "action": action.to(self.compute_device, non_blocking=True)}
 
 
-def cache_window_batches(
+def windowcache_batch_stream(cache: WindowCache, batch_size: int, seed: int):
+    """Infinite shuffled minibatch stream over a resident WindowCache."""
+
+    n = len(cache)
+    epoch = 0
+    while True:
+        order = torch.from_numpy(np.random.default_rng(seed + epoch).permutation(n))
+        for start in range(0, n, batch_size):
+            yield cache.take(order[start : start + batch_size])
+        epoch += 1
+
+
+def build_eval_batches(
     sampler: PushTHDF5Sampler,
-    window_ids: np.ndarray,
     split: str,
+    window_ids: np.ndarray,
     batch_size: int,
     seq_len: int,
-    count: int | None = None,
-    seed: int = 0,
-) -> tuple[list[dict[str, torch.Tensor]], list[dict[str, int]]]:
+    count: int | None,
+    seed: int,
+    compute_device: torch.device,
+) -> list[dict[str, torch.Tensor]]:
+    """Fixed list of eval minibatches, decoded once (GPU-resident, small)."""
+
     ids = np.asarray(window_ids, dtype=np.int64)
     if count is not None:
         keep = min(len(ids), count * batch_size)
         ids = np.random.default_rng(seed).choice(ids, size=keep, replace=False)
-    batches: list[dict[str, torch.Tensor]] = []
-    rows: list[dict[str, int]] = []
-    for start in range(0, len(ids), batch_size):
-        batch, batch_rows = sampler.window_batch(ids[start : start + batch_size], split, seq_len)
-        batches.append(batch)
-        rows.extend(batch_rows)
-    return batches, rows
+    cache = sampler.materialize_windows(split, seq_len, ids, compute_device, compute_device)
+    return [
+        cache.take(torch.arange(start, min(start + batch_size, len(cache))))
+        for start in range(0, len(cache), batch_size)
+    ]
+
+
+def resolve_cache_placement(
+    mode: str,
+    est_frames: int,
+    pixel_shape: tuple[int, ...],
+    compute_device: torch.device,
+    gpu_budget_gb: float,
+    ram_budget_gb: float,
+) -> tuple[bool, torch.device, str]:
+    """Decide where the resident training cache lives.
+
+    Returns ``(use_cache, frames_device, reason)``. Falls back to the streaming
+    path when even the CPU RAM budget would be blown.
+    """
+
+    _, height, width, channels = pixel_shape
+    est_gb = est_frames * height * width * channels / 1e9
+    if mode == "off":
+        return False, torch.device("cpu"), f"disabled (--window-cache off); would need ~{est_gb:.1f} GB"
+
+    if mode in ("auto", "gpu") and compute_device.type == "cuda":
+        free_gb = float("inf")
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(compute_device)
+            free_gb = free_bytes / 1e9
+        except Exception:  # noqa: BLE001 - fall through to the numeric budget
+            pass
+        gpu_cap = min(gpu_budget_gb, 0.5 * free_gb)
+        if est_gb <= gpu_cap:
+            return True, compute_device, f"GPU-resident (~{est_gb:.1f} GB <= {gpu_cap:.1f} GB free budget)"
+        if mode == "gpu":
+            return False, torch.device("cpu"), f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB)"
+
+    if mode in ("auto", "cpu"):
+        # Honour the flag but never exceed what the OS actually has free right
+        # now (build peaks at ~1.3x the resident size).
+        ram_cap = ram_budget_gb
+        avail_gb = None
+        try:
+            import psutil
+
+            avail_gb = psutil.virtual_memory().available / 1e9
+            ram_cap = min(ram_cap, 0.7 * avail_gb)
+        except Exception:  # noqa: BLE001 - psutil optional; fall back to the flat budget
+            pass
+        if est_gb * 1.3 <= ram_cap:
+            avail_note = f", {avail_gb:.0f} GB free" if avail_gb is not None else ""
+            return True, torch.device("cpu"), f"CPU-RAM-resident (~{est_gb:.1f} GB <= {ram_cap:.1f} GB cap{avail_note})"
+        return (
+            False,
+            torch.device("cpu"),
+            f"streaming fallback (~{est_gb:.1f} GB needs >{ram_cap:.1f} GB usable RAM; use plan-3 DataLoader)",
+        )
+
+    return False, torch.device("cpu"), f"streaming (mode={mode}, device={compute_device.type})"
+
+
+def batch_for_model(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    device = next(model.parameters()).device
+    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
 def training_batch_stream(
@@ -533,8 +735,7 @@ def mcsdca_extra(info: dict[str, Any]) -> dict[str, Any]:
 def train_baseline(
     name: str,
     model: torch.nn.Module,
-    sampler: PushTHDF5Sampler,
-    train_window_ids: np.ndarray,
+    make_stream: Callable[[int], Any],
     train_batches: list[dict[str, torch.Tensor]],
     val_batches: list[dict[str, torch.Tensor]],
     profile: TrainingProfile,
@@ -546,9 +747,7 @@ def train_baseline(
     params = select_full_model_parameters(model)
     optimizer = make_baseline_optimizer(name, params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = make_lewm_lr_scheduler(optimizer, budget)
-    stream = training_batch_stream(
-        sampler, train_window_ids, profile.batch_size, profile.history_size + profile.num_preds, args.seed
-    )
+    stream = make_stream(args.seed)
     rows: list[dict[str, Any]] = []
     train_time_s = 0.0
     progress = tqdm(total=budget, desc=name, unit="bp", leave=False, dynamic_ncols=True)
@@ -578,8 +777,7 @@ def train_baseline(
 def train_mcsdca(
     name: str,
     model: torch.nn.Module,
-    sampler: PushTHDF5Sampler,
-    train_window_ids: np.ndarray,
+    make_stream: Callable[[int], Any],
     train_batches: list[dict[str, torch.Tensor]],
     val_batches: list[dict[str, torch.Tensor]],
     profile: TrainingProfile,
@@ -591,9 +789,7 @@ def train_mcsdca(
 ) -> list[dict[str, Any]]:
     optimizer_cls = MCSDCAOdLD if name == "MCSDCA-odLD" else MCSDCAUdLD
     optimizer = optimizer_cls(select_full_model_parameters(model), mcsdca_config)
-    stream = training_batch_stream(
-        sampler, train_window_ids, profile.batch_size, profile.history_size + profile.num_preds, args.seed
-    )
+    stream = make_stream(args.seed)
     last_batch: dict[str, dict[str, torch.Tensor]] = {}
 
     def loss_fn() -> torch.Tensor:
@@ -655,6 +851,72 @@ def write_run_json(run_dir: Path, payload: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# In-process reuse across sweep points                                         #
+#                                                                             #
+# ``sweep.run_grid`` calls ``run()`` once per grid point in the same process. #
+# Only the optimizer hyper-parameters change between most points, so the      #
+# sampler, the resident window cache and the seed-specific initial weights    #
+# are memoized and shared instead of rebuilt (and re-read from disk) each     #
+# time. Keys capture everything an entry depends on; small LRU bounds keep    #
+# peak memory sane when the odLD sweep varies ``seed``.                       #
+# --------------------------------------------------------------------------- #
+_SAMPLER_MEMO: "OrderedDict[tuple, PushTHDF5Sampler]" = OrderedDict()
+_CACHE_MEMO: "OrderedDict[tuple, WindowCache]" = OrderedDict()
+_MODEL_MEMO: "OrderedDict[tuple, tuple[torch.nn.Module, dict[str, Any]]]" = OrderedDict()
+_BASESTATE_MEMO: "OrderedDict[tuple, dict[str, torch.Tensor]]" = OrderedDict()
+
+
+def _memoize(memo: "OrderedDict[tuple, Any]", key: tuple, factory: Callable[[], Any], maxsize: int) -> Any:
+    if key in memo:
+        memo.move_to_end(key)
+        return memo[key]
+    value = factory()
+    memo[key] = value
+    memo.move_to_end(key)
+    while len(memo) > max(1, maxsize):
+        _, evicted = memo.popitem(last=False)
+        closer = getattr(evicted, "close", None)
+        if callable(closer):
+            closer()
+        del evicted
+        gc.collect()
+    return value
+
+
+def get_sampler(
+    data_path: Path, frameskip: int, max_seq_len: int, action_stats_samples: int,
+    seed: int, train_fraction: float,
+) -> "tuple[PushTHDF5Sampler, tuple]":
+    key = ("sampler", str(data_path), frameskip, max_seq_len, action_stats_samples, seed, round(train_fraction, 9))
+    sampler = _memoize(
+        _SAMPLER_MEMO, key,
+        lambda: PushTHDF5Sampler(data_path, frameskip, max_seq_len, action_stats_samples, seed, train_fraction),
+        maxsize=3,
+    )
+    return sampler, key
+
+
+def get_model(model_config_path: Path, device: torch.device) -> "tuple[torch.nn.Module, dict[str, Any]]":
+    key = ("model", str(model_config_path), str(device))
+    return _memoize(_MODEL_MEMO, key, lambda: initialize_lewm(model_config_path, device), maxsize=1)
+
+
+def get_base_state(model_config_path: Path, model_config: dict[str, Any], seed: int) -> dict[str, torch.Tensor]:
+    key = ("base_state", str(model_config_path), seed)
+
+    def factory() -> dict[str, torch.Tensor]:
+        seed_everything(seed)  # reproduce "seed then instantiate" so init stays seed-specific
+        tmp = instantiate(OmegaConf.create(model_config)).to("cpu")
+        enable_full_model_training(tmp)
+        state = clone_cpu_state(tmp)
+        del tmp
+        gc.collect()
+        return state
+
+    return _memoize(_BASESTATE_MEMO, key, factory, maxsize=4)
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -672,11 +934,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     training_seq_len = profile.history_size + profile.num_preds
     max_seq_len = profile.history_size + max(ROLLOUT_HORIZONS)
 
-    sampler = PushTHDF5Sampler(
+    sampler, sampler_key = get_sampler(
         data_path, profile.frameskip, max_seq_len, args.action_stats_samples, args.seed, profile.train_fraction
     )
-    model, model_config = initialize_lewm(model_config_path, device)
-    base_state = clone_cpu_state(model)
+    model, model_config = get_model(model_config_path, device)
+    base_state = get_base_state(model_config_path, model_config, args.seed)
 
     train_window_ids = sampler.select_window_ids("train", training_seq_len, profile.data_fraction, args.seed + 2)
     val_window_ids = sampler.select_window_ids("val", max_seq_len, profile.val_eval_fraction, args.seed + 7)
@@ -684,13 +946,41 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     budget = args.backprop_budget or profile.default_budget or steps_per_epoch * profile.epochs
     eval_interval = args.eval_interval or max(1, math.ceil(budget / 10))
 
-    train_batches, _ = cache_window_batches(
-        sampler, train_window_ids, "train", profile.eval_batch_size, training_seq_len,
-        count=profile.eval_train_batches, seed=args.seed + 3,
+    # ---- resident training-window cache (plan 1/2): decode once, reuse ---- #
+    est_frames = sampler.count_unique_frames("train", training_seq_len, train_window_ids)
+    use_cache, frames_device, cache_reason = resolve_cache_placement(
+        args.window_cache, est_frames, sampler.pixel_shape, device, args.cache_max_gb, args.cache_ram_gb
     )
-    val_batches, _ = cache_window_batches(
-        sampler, val_window_ids, "val", profile.eval_batch_size, max_seq_len,
-        count=profile.val_batches, seed=args.seed + 4,
+    cache_bytes = 0
+    if use_cache:
+        cache_key = (
+            "cache", sampler_key, "train", training_seq_len,
+            round(profile.data_fraction, 12), args.seed + 2, str(frames_device), str(device),
+        )
+        train_cache = _memoize(
+            _CACHE_MEMO, cache_key,
+            lambda: sampler.materialize_windows(
+                "train", training_seq_len, train_window_ids, frames_device, device
+            ),
+            maxsize=max(1, args.cache_memo_size),
+        )
+        cache_bytes = train_cache.nbytes()
+
+        def make_stream(seed: int):
+            return windowcache_batch_stream(train_cache, profile.batch_size, seed)
+    else:
+        def make_stream(seed: int):
+            return training_batch_stream(
+                sampler, train_window_ids, profile.batch_size, training_seq_len, seed
+            )
+
+    train_batches = build_eval_batches(
+        sampler, "train", train_window_ids, profile.eval_batch_size, training_seq_len,
+        profile.eval_train_batches, args.seed + 3, device,
+    )
+    val_batches = build_eval_batches(
+        sampler, "val", val_window_ids, profile.eval_batch_size, max_seq_len,
+        profile.val_batches, args.seed + 4, device,
     )
 
     try:
@@ -706,6 +996,10 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         f"profile={args.training_profile} data_fraction={profile.data_fraction:.2%} "
         f"train_windows={len(train_window_ids):,} budget={budget:,} "
         f"(~{budget / steps_per_epoch:.1f} epochs) eval_interval={eval_interval:,}"
+    )
+    print(
+        f"  window-cache: {cache_reason}"
+        + (f"  [{cache_bytes / 1e9:.1f} GB, {est_frames:,} unique frames]" if use_cache else "")
     )
 
     all_rows: list[dict[str, Any]] = []
@@ -725,6 +1019,13 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "epochs_equivalent": budget / steps_per_epoch,
             "train_windows": int(len(train_window_ids)),
             "val_windows": int(len(val_window_ids)),
+            "window_cache": {
+                "used": bool(use_cache),
+                "reason": cache_reason,
+                "frames_device": str(frames_device) if use_cache else None,
+                "est_unique_frames": int(est_frames),
+                "resident_bytes": int(cache_bytes),
+            },
             "final_results": final_results,
         }
 
@@ -735,12 +1036,12 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         try:
             if name in BASELINE_OPTIMIZERS:
                 rows = train_baseline(
-                    name, model, sampler, train_window_ids, train_batches, val_batches,
+                    name, model, make_stream, train_batches, val_batches,
                     profile, sigreg, args, budget, eval_interval,
                 )
             else:
                 rows = train_mcsdca(
-                    name, model, sampler, train_window_ids, train_batches, val_batches,
+                    name, model, make_stream, train_batches, val_batches,
                     profile, sigreg, mcsdca_config, args, budget, eval_interval,
                 )
             final = dict(rows[-1])
@@ -783,6 +1084,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--action-stats-samples", type=int, default=20000)
+    parser.add_argument(
+        "--window-cache", choices=("auto", "gpu", "cpu", "off"), default="auto",
+        help="Resident decoded-window cache placement. auto: GPU if it fits the budget, "
+             "else CPU RAM, else stream from HDF5 (current behaviour).",
+    )
+    parser.add_argument("--cache-max-gb", type=float, default=12.0, help="GPU VRAM budget for the window cache.")
+    parser.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
+    parser.add_argument(
+        "--cache-memo-size", type=int, default=2,
+        help="How many resident caches to keep across sweep points (odLD varies seed -> 2).",
+    )
     parser.add_argument("--no-save-checkpoints", action="store_false", dest="save_checkpoints")
     parser.set_defaults(save_checkpoints=True)
     parser.add_argument("--mcsdca-epsilon", type=float, default=None)
