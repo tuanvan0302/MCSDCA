@@ -1,16 +1,19 @@
-# Stage 0 - sanity. Tiny CPU-runnable grid: does MCSDCA run, stay finite, and
-# does the inner chain loss (sampler_loss) go down for at least one corner?
-#   uv run python src/sweep.py configs/sweep/stage0_sanity.yaml
+# Stage 0 - sanity. Tiny grid: do BOTH MCSDCA variants run, stay finite, and does
+# the inner chain loss (sampler_loss) go down for at least one corner? Includes
+# the most aggressive step sizes (eta 3e-2, delta 0.3) so divergence surfaces
+# here, not in Stage 1 / Stage 4.
+#   python src/sweep.py configs/sweep/stage0_sanity.yaml
 base:
   training_profile: smoke
   data_fraction: 0.05
-  optimizers: MCSDCA-odLD
+  optimizers: MCSDCA-odLD,MCSDCA-udLD
   backprop_budget: 120
   eval_interval: 40
-  device: auto
+  device: cuda
   seed: 3072
 grid:
-  mcsdca_eta: [1.0e-3, 1.0e-2]
-  mcsdca_epsilon: [1.0e-8, 1.0e-2]
+  mcsdca_eta: [3.0e-3, 3.0e-2]          # odLD step size: calm + aggressive end of Stage-1
+  mcsdca_epsilon_ratio: [1.0e-6, 1.0e0] # epsilon = ratio * eta: near-deterministic + strong noise
   mcsdca_beta0: [0.9]
+  mcsdca_delta: [0.03, 0.3]             # udLD step size: calm + aggressive end of Stage-4
 output: outputs/sweep/stage0_sanity

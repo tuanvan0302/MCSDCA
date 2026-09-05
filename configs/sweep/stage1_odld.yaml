@@ -1,18 +1,36 @@
-# Stage 1 - coarse odLD sweep (GPU). 3 x 3 x 3 = 27 points, 1 seed, PushT 10%.
-# LR_eff ~= beta0 * (n_k/2) * eta, so eta/beta0 are partly redundant - the grid
-# maps their interaction plus the epsilon (Langevin noise) regime.
-# Set --backprop-budget to ~25% of the `small` full budget for your hardware
-# (small full budget = steps_per_epoch * 10; print it with a 1-step dry run).
-# Rank afterwards:  uv run python src/sweep.py configs/sweep/stage1_odld.yaml --select-only
+# Stage 1 - coarse odLD sweep (RTX 3090). 3 x 3 x 3 = 27, minus 6 divergent
+# corners (eta=3e-2 x beta0 in {0.9,0.99} x 3 ratios) = 21 points, 1 seed,
+# PushT 10%.
+#
+# LR_eff ~= beta0 * (n_k/2) * eta, so eta and beta0 are partly redundant - the
+# grid maps their interaction. epsilon is swept as the RATIO epsilon/eta
+# (sweep.make_args sets epsilon = ratio * eta), so what varies is the Langevin
+# noise-to-signal regime, not an eta-dependent absolute:
+#   ratio 1e-6 -> near-deterministic (paper's viscosity-vanishing regime)
+#   ratio 1e-2 -> mild Langevin exploration
+#   ratio 1e0  -> strong exploration (noise ~ gradient step, SGLD-like)
+# eta range is shifted up: 1e-3 stalls (per 00_MCSDCA_paper_experiments).
+# n_k and gamma_k are NOT swept - they follow the paper's growing schedules
+# n_k = base + floor((k+1)^power), gamma_k = gamma_0 * (k+1)^power.
+#
+# The two eta=3e-2 x beta0>=0.9 corners give LR_eff ~ 0.08-0.09 and diverge from
+# a from-scratch init, so they are excluded rather than burning a rank slot.
+#
+# backprop_budget is a FIXED "rank budget" (enough to rank configs, not to
+# converge them); ~1 h total on a 3090 at batch 64.
+# Rank afterwards:  python src/sweep.py configs/sweep/stage1_odld.yaml --select-only
 base:
   training_profile: small
   data_fraction: 0.10
   optimizers: MCSDCA-odLD
-  backprop_budget: 14000        # <-- tune to hardware (~25% of small full budget)
-  device: auto
+  backprop_budget: 3000
+  device: cuda
   seed: 3072
 grid:
-  mcsdca_eta: [1.0e-3, 3.0e-3, 1.0e-2]
-  mcsdca_epsilon: [1.0e-8, 1.0e-4, 1.0e-2]
+  mcsdca_eta: [3.0e-3, 1.0e-2, 3.0e-2]
+  mcsdca_epsilon_ratio: [1.0e-6, 1.0e-2, 1.0e0]
   mcsdca_beta0: [0.5, 0.9, 0.99]
+exclude:
+  - {mcsdca_eta: 3.0e-2, mcsdca_beta0: 0.9}
+  - {mcsdca_eta: 3.0e-2, mcsdca_beta0: 0.99}
 output: outputs/sweep/stage1_odld

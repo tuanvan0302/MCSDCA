@@ -93,14 +93,16 @@ TRAINING_PROFILES: dict[str, TrainingProfile] = {
         mcsdca=MCSDCAConfig(langevin_steps=3, langevin_steps_power=0.25, max_langevin_steps=4, burn_in=1),
     ),
     "small": TrainingProfile(
+        # Tuned for a single RTX 3090 (24 GB): batch 64 + 512 SIGReg projections
+        # fit comfortably in fp32; more eval batches keep the ranking signal clean.
         data_fraction=0.10,
         epochs=10,
-        batch_size=32,
-        eval_batch_size=4,
-        eval_train_batches=8,
-        val_batches=8,
+        batch_size=64,
+        eval_batch_size=8,
+        eval_train_batches=16,
+        val_batches=16,
         precision="fp32",
-        sigreg_num_proj=256,
+        sigreg_num_proj=512,
         mcsdca=MCSDCAConfig(),
     ),
     "medium": TrainingProfile(

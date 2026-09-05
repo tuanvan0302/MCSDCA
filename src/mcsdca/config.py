@@ -12,7 +12,16 @@ class MCSDCAConfig:
     ``epsilon`` is raised from the paper's 1e-8 (viscosity-vanishing) to 1e-2 for
     genuine Langevin exploration, and ``od_eta`` from 1e-3 to 3e-3 (1e-3 stalls,
     per 00_MCSDCA_paper_experiments). Markov chains are kept short (5/2 vs the
-    paper's 20/10) for compute. All are meant to be swept.
+    paper's 20/10) for compute.
+
+    ``n_k`` and ``gamma_k`` are adaptive during training and NOT swept: chain
+    length grows as ``langevin_steps + floor((k+1)^langevin_steps_power)`` and
+    the proximal coefficient as ``gamma_0 * (k+1)^gamma_power``.
+
+    The Experiment-1 sweeps vary ``od_eta`` over {3e-3, 1e-2, 3e-2} and
+    ``epsilon`` as the RATIO epsilon/eta over {1e-6, 1e-2, 1e0} (see
+    src/sweep.py), so the Langevin noise-to-signal regime is the knob rather
+    than an eta-dependent absolute; ``ud_delta`` over {0.03, 0.1, 0.3}.
     """
 
     langevin_steps: int = 5  # Base Markov-chain length n_k = base + floor((k+1)^power)

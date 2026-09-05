@@ -1,14 +1,16 @@
-# Stage 2 - refine odLD around the Stage-1 top-2, full `small` budget, 1 seed.
-# EDIT the grid below to bracket the Stage-1 winners before running.
+# Stage 2 - refine odLD around the Stage-1 TOP-3, longer rank budget, 2 seeds.
+# select_best now averages rollout_mse_5 across seeds before ranking, so bracket
+# the three best Stage-1 configs here and let the seeds decide. EDIT the grid to
+# bracket them; epsilon is still swept as the ratio epsilon/eta.
 base:
   training_profile: small
   data_fraction: 0.10
   optimizers: MCSDCA-odLD
-  # backprop_budget omitted -> uses the `small` profile full budget
-  device: auto
-  seed: 3072
+  backprop_budget: 5000
+  device: cuda
 grid:
-  mcsdca_eta: [2.0e-3, 3.0e-3, 5.0e-3]     # <-- edit around Stage-1 winner
-  mcsdca_epsilon: [1.0e-8, 1.0e-6]         # <-- edit around Stage-1 winner
-  mcsdca_beta0: [0.9, 0.99]                # <-- edit around Stage-1 winner
+  seed: [3072, 3073]
+  mcsdca_eta: [3.0e-3, 1.0e-2]            # <-- edit around the Stage-1 top-3
+  mcsdca_epsilon_ratio: [1.0e-6, 1.0e-2]  # <-- edit around the Stage-1 top-3
+  mcsdca_beta0: [0.5, 0.9]               # <-- edit around the Stage-1 top-3
 output: outputs/sweep/stage2_odld

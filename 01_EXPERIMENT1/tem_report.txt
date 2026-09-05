@@ -1,0 +1,43 @@
+Trong Le-wm:
+I. Về kiến trúc
+
+II. Về bộ dữ liệu PushT
+Quá trình huấn luyện
+Le-wm config:
++ num_workers=6 Số worker của DataLoader
++ train_split=0.9 90% train / 10% val (chia ngẫu nhiên theo seed)
++ seed=3072 Seed cho chia dữ liệu + generator
++ img_size=224 Ảnh resize về 224×224 trước khi vào ViT
++ embed_dim=192 Số chiều không gian tiềm ẩn (latent)
++ history_size=3 Số frame ngữ cảnh đưa vào predictor
++ num_preds=1 Dự đoán 1 bước kế tiếp (one-step prediction)
+
+Trainer pytorch:
++ max_epochs=100, tuy nhiên chỉ cần train 10 epochs là đạt đạt được best performance.
++ accelerator=gpu
++ precision=bf16
++ gradient_clip_val=1.0 clip norm gradient để ổn định
+
+Loader 
+
+Optimizer: AdamW
+
+Đặc biệt Le-wm chỉ có một tham số được cập nhật là SIGReg (bộ điều chuẩn ép embedding về phân phối Gaussian, chống sụp đổ biểu diễn)
+loss = pred_loss + 0.09 * sigreg_loss
+pred_loss  = MSE(pred_emb, tgt_emb)   # next-embedding prediction
+sigreg_loss = SIGReg(emb)             # Gaussian regularizer
+
+PushT config:
++ num_steps=4 (num_preds + history_size = 4) Mỗi mẫu là cửa sổ 4 bước thời gian liên tiếp (đã frameskip)
++ frameskip=5 Lấy 1 frame mỗi 5 frame mô phỏng; hành động đưa vào model là ghép 5 action thô → action_encoder.input_dim = 5 × dim(action)
++ name: pusht_expert_train.lance
++ keys_to_load: pixels, action, proprio, state
++ keys_to_cache: action, proprio, state
+
+JEPA config:
++ encoder: vit_hf size tiny, patch_size: 14, image_size: 224, pretrained: false → ViT-Tiny huấn luyện từ đầu, không dùng encoder pretrained
++ predictor: transformer nhân quả tự hồi quy: num_frames: 3, dim: 192, depth: 6, heads: 16, mlp_dim: 2048, dim_head: 64, dropout: 0.1.
++ action_encoder: module.Embedder, input_dim gán lúc runtime (= 5 × action_dim), emb_dim: 192
++ projector & pred_proj: MLP 192 → 2048 → 192 kèm BatchNorm1d. Hai lớp chiếu này bù cho LayerNorm ở cuối encoder/predictor (LayerNorm phá cơ chế chống sụp đổ)
+
+Quá trình đánh giá
