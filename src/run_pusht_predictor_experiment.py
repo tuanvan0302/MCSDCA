@@ -685,12 +685,19 @@ def resolve_cache_placement(
     ram_budget_gb: float,
     disk_budget_gb: float,
     memmap_dir: Path,
+    gpu_reserve_gb: float = 14.0,
 ) -> tuple[bool, torch.device, str, str]:
     """Decide where the resident training cache lives.
 
     Returns ``(use_cache, frames_device, backing, reason)`` where ``backing`` is
     ``"cuda"`` (GPU), ``"cpu"`` (host RAM), ``"memmap"`` (on-disk NVMe, page
     cached) or ``"none"`` (fall back to the per-batch HDF5 stream).
+
+    A GPU-resident cache competes with the model + activations + (for MCSDCA)
+    the retained-sample chain, so it is only chosen when ``est_gb`` fits under
+    both ``gpu_budget_gb`` and ``free - gpu_reserve_gb`` (headroom left for
+    training). Otherwise it drops to host RAM / disk, which is nearly free once
+    prefetch hides the transfer.
     """
 
     _, height, width, channels = pixel_shape
@@ -706,11 +713,15 @@ def resolve_cache_placement(
             free_gb = free_bytes / 1e9
         except Exception:  # noqa: BLE001 - fall through to the numeric budget
             pass
-        gpu_cap = min(gpu_budget_gb, 0.5 * free_gb)
+        reserve = 0.0 if mode == "gpu" else max(0.0, gpu_reserve_gb)  # explicit --window-cache gpu skips the reserve
+        gpu_cap = min(gpu_budget_gb, max(0.0, free_gb - reserve))
         if est_gb <= gpu_cap:
-            return True, compute_device, "cuda", f"GPU-resident (~{est_gb:.1f} GB <= {gpu_cap:.1f} GB free budget)"
+            return True, compute_device, "cuda", (
+                f"GPU-resident (~{est_gb:.1f} GB <= {gpu_cap:.1f} GB; "
+                f"{free_gb:.0f} GB free, {reserve:.0f} GB reserved for training)"
+            )
         if mode == "gpu":
-            return False, cpu, "none", f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB)"
+            return False, cpu, "none", f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB free)"
 
     if mode in ("auto", "cpu"):
         # Honour the flag but never exceed what the OS actually has free right
@@ -1123,6 +1134,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     use_cache, frames_device, backing, cache_reason = resolve_cache_placement(
         args.window_cache, est_frames, sampler.pixel_shape, device,
         args.cache_max_gb, args.cache_ram_gb, args.cache_disk_gb, memmap_dir,
+        gpu_reserve_gb=getattr(args, "cache_gpu_reserve_gb", 14.0),
     )
     cache_bytes = 0
     prefetch = 0
@@ -1274,7 +1286,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decoded-window cache placement. auto: GPU if it fits, else CPU RAM, else on-disk "
              "memmap (page-cached), else stream from HDF5. off = always stream.",
     )
-    parser.add_argument("--cache-max-gb", type=float, default=12.0, help="GPU VRAM budget for the window cache.")
+    parser.add_argument("--cache-max-gb", type=float, default=6.0, help="GPU VRAM budget for the window cache.")
+    parser.add_argument("--cache-gpu-reserve-gb", type=float, default=14.0,
+                        help="VRAM to leave free for model+activations+MCSDCA chain (auto mode only).")
     parser.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
     parser.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
     parser.add_argument(
