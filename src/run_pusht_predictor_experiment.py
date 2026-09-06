@@ -724,18 +724,22 @@ def resolve_cache_placement(
             return False, cpu, "none", f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB free)"
 
     if mode in ("auto", "cpu"):
-        # Honour the flag but never exceed what the OS actually has free right
-        # now (build peaks at ~1.3x the resident size).
-        ram_cap = ram_budget_gb
+        # ram_budget_gb <= 0 means "auto": scale with the RAM this box actually
+        # has free. A positive value is an explicit ceiling, still clamped to
+        # what is free. Slab-wise build peaks at ~resident + one read chunk, so
+        # the safety margin is small.
         avail_gb = None
         try:
             import psutil
 
             avail_gb = psutil.virtual_memory().available / 1e9
-            ram_cap = min(ram_cap, 0.7 * avail_gb)
-        except Exception:  # noqa: BLE001 - psutil optional; fall back to the flat budget
+        except Exception:  # noqa: BLE001 - psutil optional
             pass
-        if est_gb * 1.3 <= ram_cap:
+        if ram_budget_gb and ram_budget_gb > 0:
+            ram_cap = min(ram_budget_gb, 0.85 * avail_gb) if avail_gb is not None else ram_budget_gb
+        else:
+            ram_cap = 0.6 * avail_gb if avail_gb is not None else 64.0
+        if est_gb * 1.05 <= ram_cap:
             note = f", {avail_gb:.0f} GB free" if avail_gb is not None else ""
             return True, cpu, "cpu", f"CPU-RAM-resident (~{est_gb:.1f} GB <= {ram_cap:.1f} GB cap{note})"
         if mode == "cpu":
@@ -1289,7 +1293,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-max-gb", type=float, default=6.0, help="GPU VRAM budget for the window cache.")
     parser.add_argument("--cache-gpu-reserve-gb", type=float, default=14.0,
                         help="VRAM to leave free for model+activations+MCSDCA chain (auto mode only).")
-    parser.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
+    parser.add_argument("--cache-ram-gb", type=float, default=0.0,
+                        help="Host RAM budget for the window cache (0 = auto: 0.6x free RAM).")
     parser.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
     parser.add_argument(
         "--memmap-dir", default=None,

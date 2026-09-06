@@ -296,7 +296,8 @@ def build_parser_e1() -> argparse.ArgumentParser:
     p.add_argument("--cache-max-gb", type=float, default=6.0, help="GPU VRAM budget for the window cache.")
     p.add_argument("--cache-gpu-reserve-gb", type=float, default=14.0,
                    help="VRAM left free for model+activations+MCSDCA chain before a GPU-resident cache is chosen.")
-    p.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
+    p.add_argument("--cache-ram-gb", type=float, default=0.0,
+                   help="Host RAM budget for the window cache (0 = auto: 0.6x free RAM).")
     p.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
     p.add_argument("--memmap-dir", default=None, help="Dir for decoded-frame memmaps (default <data dir>/.framecache).")
     p.add_argument("--prefetch-depth", type=int, default=3, help="Minibatches read ahead on background threads (0 = off).")
