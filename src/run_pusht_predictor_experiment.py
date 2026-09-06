@@ -14,12 +14,17 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import math
+import os
+import shutil
 import sys
 import time
 import traceback
-from collections import OrderedDict
+import warnings
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -226,6 +231,33 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+_COMPUTE_TUNED = False
+
+
+def tune_compute(device: torch.device, num_threads: int = 0) -> None:
+    """Idempotent process-wide compute knobs (plan 5, no torch.compile).
+
+    On CUDA: enable TF32 matmul + cuDNN autotune (2-4x on Ampere+, negligible
+    accuracy impact for this training). Always: cap intra-op threads so the
+    CPU-side gather / normalize / numpy work uses cores without oversubscribing.
+    """
+
+    global _COMPUTE_TUNED
+    threads = num_threads if num_threads and num_threads > 0 else max(1, min(16, os.cpu_count() or 8))
+    torch.set_num_threads(threads)
+    if _COMPUTE_TUNED:
+        return
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:  # noqa: BLE001 - older torch
+            pass
+    _COMPUTE_TUNED = True
+
+
 # --------------------------------------------------------------------------- #
 # PushT HDF5 sampler (deterministic sequence windows only)                     #
 # --------------------------------------------------------------------------- #
@@ -252,6 +284,7 @@ class PushTHDF5Sampler:
         # every per-window action slice is then a pure numpy view.
         self._h5 = self.h5py.File(path, "r", rdcc_nbytes=256 * 1024 * 1024)
         self._pixels_ds = self._h5["pixels"]
+        self._mtime = int(Path(path).stat().st_mtime)
         self.ep_len = np.asarray(self._h5["ep_len"][:])
         self.ep_offset = np.asarray(self._h5["ep_offset"][:])
         self.pixel_shape = tuple(self._h5["pixels"].shape)
@@ -382,6 +415,30 @@ class PushTHDF5Sampler:
         windows = self._resolve_windows(split, seq_len, window_ids)
         return int(np.unique(self._window_frame_ids(windows, seq_len)).size)
 
+    def _fill_frames(self, dst: Any, uniq: np.ndarray, read_chunk: int) -> None:
+        """Read the unique frames ``uniq`` (sorted) from HDF5 in contiguous runs
+        into ``dst`` (a ``[F, C, H, W]`` torch tensor slice-assignable, or an
+        ``np.memmap``). One big slab read per run, permuted H,W,C -> C,H,W."""
+
+        is_tensor = isinstance(dst, torch.Tensor)
+        boundaries = np.flatnonzero(np.diff(uniq) != 1)
+        run_edges = np.concatenate(([0], boundaries + 1, [uniq.size]))
+        for lo_pos, hi_pos in zip(run_edges[:-1], run_edges[1:], strict=True):
+            first = int(uniq[lo_pos])  # run is fully contiguous: uniq[lo_pos:hi_pos] == first + arange(...)
+            for sub in range(int(lo_pos), int(hi_pos), read_chunk):
+                sub_hi = min(sub + read_chunk, int(hi_pos))
+                slab = self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
+                chw = np.ascontiguousarray(np.moveaxis(slab, 3, 1))  # [n, C, H, W]
+                dst[sub:sub_hi] = torch.from_numpy(chw) if is_tensor else chw
+
+    def _window_actions(self, windows: list[tuple[int, int, int, int]], seq_len: int) -> torch.Tensor:
+        raw_span = self.frameskip * seq_len
+        gather = (
+            np.fromiter((w[1] for w in windows), dtype=np.int64, count=len(windows))[:, None]
+            + np.arange(raw_span, dtype=np.int64)[None, :]
+        )
+        return self._normalize_actions(self._actions_all[gather], seq_len)
+
     def materialize_windows(
         self,
         split: str,
@@ -391,45 +448,80 @@ class PushTHDF5Sampler:
         compute_device: torch.device,
         read_chunk: int = 1024,
     ) -> "WindowCache":
-        """Decode every requested window once and keep it resident.
-
-        Unique frames are read from HDF5 in contiguous runs and written slab by
-        slab straight into the destination ``[F, C, H, W] uint8`` tensor on
-        ``frames_device`` (no full-size intermediate copy). Per-batch gathering +
-        float normalization then happens on ``compute_device`` with no further
-        disk access.
-        """
+        """Decode every requested window once into a resident ``[F, C, H, W]``
+        ``uint8`` tensor on ``frames_device`` (GPU or CPU RAM). Per-batch
+        gathering + float normalization then happens on ``compute_device`` with
+        no further disk access."""
 
         windows = self._resolve_windows(split, seq_len, window_ids)
-        frame_ids = self._window_frame_ids(windows, seq_len)  # [N, seq_len]
+        frame_ids = self._window_frame_ids(windows, seq_len)
         uniq = np.unique(frame_ids)
         _, height, width, channels = self.pixel_shape
 
         frames_t = torch.empty((uniq.size, channels, height, width), dtype=torch.uint8, device=frames_device)
-        boundaries = np.flatnonzero(np.diff(uniq) != 1)
-        run_edges = np.concatenate(([0], boundaries + 1, [uniq.size]))
-        for lo_pos, hi_pos in zip(run_edges[:-1], run_edges[1:], strict=True):
-            first = int(uniq[lo_pos])  # run is fully contiguous: uniq[lo_pos:hi_pos] == first + arange(...)
-            for sub in range(int(lo_pos), int(hi_pos), read_chunk):
-                sub_hi = min(sub + read_chunk, int(hi_pos))
-                slab = self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
-                frames_t[sub:sub_hi] = torch.from_numpy(np.ascontiguousarray(slab)).permute(0, 3, 1, 2)
-
-        local_rows = np.searchsorted(uniq, frame_ids).astype(np.int64)  # [N, seq_len]
-
-        raw_span = self.frameskip * seq_len
-        action_gather = (
-            np.fromiter((w[1] for w in windows), dtype=np.int64, count=len(windows))[:, None]
-            + np.arange(raw_span, dtype=np.int64)[None, :]
-        )
-        window_actions = self._normalize_actions(self._actions_all[action_gather], seq_len)
+        self._fill_frames(frames_t, uniq, read_chunk)
+        local_rows = np.searchsorted(uniq, frame_ids).astype(np.int64)
 
         return WindowCache(
             frames_u8=frames_t,
             window_frame_rows=torch.from_numpy(local_rows).to(frames_device),
-            window_actions=window_actions.to(compute_device),
+            window_actions=self._window_actions(windows, seq_len),  # small; moved to device per-batch
             seq_len=seq_len,
             compute_device=compute_device,
+            backing=frames_device.type,
+        )
+
+    def materialize_windows_memmap(
+        self,
+        split: str,
+        seq_len: int,
+        window_ids: np.ndarray,
+        memmap_dir: Path,
+        compute_device: torch.device,
+        read_chunk: int = 2048,
+    ) -> "WindowCache":
+        """Like ``materialize_windows`` but the unique frames live in an on-disk
+        ``uint8`` memmap (NVMe). The OS page cache keeps the hot working set in
+        RAM after the first epoch; the decode pass runs once and is reused across
+        sweep points / reruns via a content hash."""
+
+        windows = self._resolve_windows(split, seq_len, window_ids)
+        frame_ids = self._window_frame_ids(windows, seq_len)
+        uniq = np.unique(frame_ids)
+        _, height, width, channels = self.pixel_shape
+        shape = (int(uniq.size), channels, height, width)
+
+        tag = hashlib.sha1(
+            repr((str(self.path), self._mtime, split, seq_len, shape,
+                  int(uniq[0]), int(uniq[-1]), int(len(window_ids)))).encode()
+        ).hexdigest()[:16]
+        Path(memmap_dir).mkdir(parents=True, exist_ok=True)
+        dat = Path(memmap_dir) / f"frames_{split}_{tag}.dat"
+        meta = dat.with_suffix(".json")
+        want = {"shape": list(shape), "dtype": "uint8"}
+        ready = dat.exists() and meta.exists() and json.loads(meta.read_text(encoding="utf-8")) == want
+
+        if ready:
+            frames_np = np.memmap(dat, dtype=np.uint8, mode="r", shape=shape)
+        else:
+            frames_np = np.memmap(dat, dtype=np.uint8, mode="w+", shape=shape)
+            self._fill_frames(frames_np, uniq, read_chunk)
+            frames_np.flush()
+            meta.write_text(json.dumps(want), encoding="utf-8")
+
+        local_rows = np.searchsorted(uniq, frame_ids).astype(np.int64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # read-only memmap -> "non-writable tensor" notice
+            frames_t = torch.from_numpy(frames_np)
+
+        return WindowCache(
+            frames_u8=frames_t,
+            window_frame_rows=torch.from_numpy(local_rows),
+            window_actions=self._window_actions(windows, seq_len),  # kept on CPU; moved per-batch
+            seq_len=seq_len,
+            compute_device=compute_device,
+            backing="memmap",
+            disk_path=dat,
         )
 
     def describe(self) -> dict[str, Any]:
@@ -459,17 +551,17 @@ class WindowCache:
     ``compute_device`` with zero disk access.
     """
 
-    frames_u8: torch.Tensor          # [F, C, H, W] uint8
+    frames_u8: torch.Tensor          # [F, C, H, W] uint8 (GPU / CPU RAM / memmap-backed)
     window_frame_rows: torch.Tensor  # [N, seq_len] int64, indices into frames_u8
     window_actions: torch.Tensor     # [N, seq_len, frameskip*A] float32
     seq_len: int
     compute_device: torch.device
+    backing: str = "memory"          # "cuda" | "cpu" | "memmap"
+    disk_path: Path | None = None
 
     def __post_init__(self) -> None:
-        mean = IMAGE_MEAN.to(self.compute_device, dtype=torch.float32)
-        std = IMAGE_STD.to(self.compute_device, dtype=torch.float32)
-        self._mean = mean
-        self._std = std
+        self._mean = IMAGE_MEAN.to(self.compute_device, dtype=torch.float32)
+        self._std = IMAGE_STD.to(self.compute_device, dtype=torch.float32)
         self._frame_shape = tuple(self.frames_u8.shape[1:])  # (C, H, W)
 
     def __len__(self) -> int:
@@ -482,29 +574,83 @@ class WindowCache:
             + self.window_actions.element_size() * self.window_actions.nelement()
         )
 
+    def gather_cpu(self, idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        """CPU-only, thread-safe: gather raw ``uint8`` pixels + actions for a
+        batch (this is the page-faulting / NVMe read for the memmap backend).
+        Pins the result when possible so the follow-up H2D copy can overlap."""
+
+        idx = idx.to("cpu", dtype=torch.long)
+        rows = self.window_frame_rows.index_select(0, idx).reshape(-1)
+        pixels_u8 = self.frames_u8.index_select(0, rows)          # [batch*seq_len, C, H, W] uint8
+        action = self.window_actions.index_select(0, idx)
+        try:
+            pixels_u8 = pixels_u8.pin_memory()
+            action = action.pin_memory()
+        except Exception:  # noqa: BLE001 - no CUDA / pinning unavailable
+            pass
+        return {"pixels_u8": pixels_u8, "action": action, "batch": idx.shape[0]}
+
+    def finalize(self, raw: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+        """Move a ``gather_cpu`` result to ``device`` and float-normalize (cheap;
+        runs on the consumer thread)."""
+
+        pixels = raw["pixels_u8"].to(device, non_blocking=True)
+        pixels = pixels.reshape(raw["batch"], self.seq_len, *self._frame_shape)
+        pixels = pixels.float().div_(255.0).sub_(self._mean).div_(self._std)
+        return {"pixels": pixels, "action": raw["action"].to(device, non_blocking=True)}
+
     def take(self, idx: torch.Tensor) -> dict[str, torch.Tensor]:
-        """A ``{'pixels', 'action'}`` batch for the given window rows."""
+        """A ready ``{'pixels', 'action'}`` batch on ``compute_device`` (used by
+        the GPU/RAM tiers and by eval; the memmap tier goes through
+        ``gather_cpu`` + ``finalize`` on separate threads)."""
 
         idx = idx.to(self.window_frame_rows.device, dtype=torch.long)
         batch = idx.shape[0]
-        rows = self.window_frame_rows.index_select(0, idx).reshape(-1)  # [batch*seq_len]
-        frames = self.frames_u8.index_select(0, rows)                    # [batch*seq_len, C, H, W] uint8
+        rows = self.window_frame_rows.index_select(0, idx).reshape(-1)
+        frames = self.frames_u8.index_select(0, rows)
         pixels = frames.to(self.compute_device, non_blocking=True).reshape(batch, self.seq_len, *self._frame_shape)
         pixels = pixels.float().div_(255.0).sub_(self._mean).div_(self._std)
         action = self.window_actions.index_select(0, idx.to(self.window_actions.device))
         return {"pixels": pixels, "action": action.to(self.compute_device, non_blocking=True)}
 
 
-def windowcache_batch_stream(cache: WindowCache, batch_size: int, seed: int):
-    """Infinite shuffled minibatch stream over a resident WindowCache."""
+def _window_index_stream(n: int, batch_size: int, seed: int):
+    """Infinite stream of shuffled window-index tensors (one per minibatch)."""
 
-    n = len(cache)
     epoch = 0
     while True:
-        order = torch.from_numpy(np.random.default_rng(seed + epoch).permutation(n))
+        order = np.random.default_rng(seed + epoch).permutation(n)
         for start in range(0, n, batch_size):
-            yield cache.take(order[start : start + batch_size])
+            yield torch.from_numpy(order[start : start + batch_size])
         epoch += 1
+
+
+def windowcache_batch_stream(
+    cache: WindowCache, batch_size: int, seed: int, prefetch: int = 0, workers: int = 1
+):
+    """Minibatch stream over a WindowCache.
+
+    ``prefetch <= 0``: synchronous ``take`` (GPU/RAM tiers - no transfer to hide).
+    ``prefetch > 0``: a thread pool runs the ``gather_cpu`` reads ``prefetch``
+    batches ahead (ordered) while the consumer thread does the small H2D +
+    normalize - this is what hides NVMe latency for the memmap tier.
+    """
+
+    idxs = _window_index_stream(len(cache), batch_size, seed)
+    if prefetch <= 0:
+        for idx in idxs:
+            yield cache.take(idx)
+        return
+
+    pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="wcache")
+    try:
+        inflight = deque(pool.submit(cache.gather_cpu, next(idxs)) for _ in range(prefetch))
+        while True:
+            done = inflight.popleft()
+            inflight.append(pool.submit(cache.gather_cpu, next(idxs)))
+            yield cache.finalize(done.result(), cache.compute_device)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def build_eval_batches(
@@ -537,17 +683,21 @@ def resolve_cache_placement(
     compute_device: torch.device,
     gpu_budget_gb: float,
     ram_budget_gb: float,
-) -> tuple[bool, torch.device, str]:
+    disk_budget_gb: float,
+    memmap_dir: Path,
+) -> tuple[bool, torch.device, str, str]:
     """Decide where the resident training cache lives.
 
-    Returns ``(use_cache, frames_device, reason)``. Falls back to the streaming
-    path when even the CPU RAM budget would be blown.
+    Returns ``(use_cache, frames_device, backing, reason)`` where ``backing`` is
+    ``"cuda"`` (GPU), ``"cpu"`` (host RAM), ``"memmap"`` (on-disk NVMe, page
+    cached) or ``"none"`` (fall back to the per-batch HDF5 stream).
     """
 
     _, height, width, channels = pixel_shape
     est_gb = est_frames * height * width * channels / 1e9
+    cpu = torch.device("cpu")
     if mode == "off":
-        return False, torch.device("cpu"), f"disabled (--window-cache off); would need ~{est_gb:.1f} GB"
+        return False, cpu, "none", f"disabled (--window-cache off); would need ~{est_gb:.1f} GB"
 
     if mode in ("auto", "gpu") and compute_device.type == "cuda":
         free_gb = float("inf")
@@ -558,9 +708,9 @@ def resolve_cache_placement(
             pass
         gpu_cap = min(gpu_budget_gb, 0.5 * free_gb)
         if est_gb <= gpu_cap:
-            return True, compute_device, f"GPU-resident (~{est_gb:.1f} GB <= {gpu_cap:.1f} GB free budget)"
+            return True, compute_device, "cuda", f"GPU-resident (~{est_gb:.1f} GB <= {gpu_cap:.1f} GB free budget)"
         if mode == "gpu":
-            return False, torch.device("cpu"), f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB)"
+            return False, cpu, "none", f"forced GPU cache too big (~{est_gb:.1f} GB > {gpu_cap:.1f} GB)"
 
     if mode in ("auto", "cpu"):
         # Honour the flag but never exceed what the OS actually has free right
@@ -575,15 +725,35 @@ def resolve_cache_placement(
         except Exception:  # noqa: BLE001 - psutil optional; fall back to the flat budget
             pass
         if est_gb * 1.3 <= ram_cap:
-            avail_note = f", {avail_gb:.0f} GB free" if avail_gb is not None else ""
-            return True, torch.device("cpu"), f"CPU-RAM-resident (~{est_gb:.1f} GB <= {ram_cap:.1f} GB cap{avail_note})"
-        return (
-            False,
-            torch.device("cpu"),
-            f"streaming fallback (~{est_gb:.1f} GB needs >{ram_cap:.1f} GB usable RAM; use plan-3 DataLoader)",
+            note = f", {avail_gb:.0f} GB free" if avail_gb is not None else ""
+            return True, cpu, "cpu", f"CPU-RAM-resident (~{est_gb:.1f} GB <= {ram_cap:.1f} GB cap{note})"
+        if mode == "cpu":
+            return False, cpu, "none", (
+                f"streaming fallback (~{est_gb:.1f} GB > {ram_cap:.1f} GB RAM cap; "
+                f"try --window-cache memmap or a smaller --data)"
+            )
+
+    if mode in ("auto", "memmap"):
+        free_disk_gb = float("inf")
+        try:
+            free_disk_gb = shutil.disk_usage(str(memmap_dir)).free / 1e9
+        except Exception:  # noqa: BLE001 - directory may not exist yet
+            try:
+                free_disk_gb = shutil.disk_usage(str(Path(memmap_dir).anchor or ".")).free / 1e9
+            except Exception:  # noqa: BLE001
+                pass
+        disk_cap = min(disk_budget_gb, 0.9 * free_disk_gb)
+        if est_gb <= disk_cap:
+            return True, cpu, "memmap", (
+                f"disk memmap (~{est_gb:.1f} GB in {memmap_dir}, page-cached; "
+                f"{free_disk_gb:.0f} GB free)"
+            )
+        return False, cpu, "none", (
+            f"streaming fallback (~{est_gb:.1f} GB > RAM and disk caps; "
+            f"raise --cache-ram-gb / --cache-disk-gb or use a smaller --data)"
         )
 
-    return False, torch.device("cpu"), f"streaming (mode={mode}, device={compute_device.type})"
+    return False, cpu, "none", f"streaming (mode={mode}, device={compute_device.type})"
 
 
 def batch_for_model(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -928,6 +1098,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    tune_compute(device, getattr(args, "num_threads", 0))
     seed_everything(args.seed)
 
     profile = resolve_profile(args)
@@ -946,28 +1117,37 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     budget = args.backprop_budget or profile.default_budget or steps_per_epoch * profile.epochs
     eval_interval = args.eval_interval or max(1, math.ceil(budget / 10))
 
-    # ---- resident training-window cache (plan 1/2): decode once, reuse ---- #
+    # ---- resident training-window cache (plans 1-4): decode once, reuse ---- #
+    memmap_dir = Path(args.memmap_dir).resolve() if args.memmap_dir else (data_path.parent / ".framecache")
     est_frames = sampler.count_unique_frames("train", training_seq_len, train_window_ids)
-    use_cache, frames_device, cache_reason = resolve_cache_placement(
-        args.window_cache, est_frames, sampler.pixel_shape, device, args.cache_max_gb, args.cache_ram_gb
+    use_cache, frames_device, backing, cache_reason = resolve_cache_placement(
+        args.window_cache, est_frames, sampler.pixel_shape, device,
+        args.cache_max_gb, args.cache_ram_gb, args.cache_disk_gb, memmap_dir,
     )
     cache_bytes = 0
+    prefetch = 0
     if use_cache:
         cache_key = (
             "cache", sampler_key, "train", training_seq_len,
-            round(profile.data_fraction, 12), args.seed + 2, str(frames_device), str(device),
+            round(profile.data_fraction, 12), args.seed + 2, backing, str(device),
         )
-        train_cache = _memoize(
-            _CACHE_MEMO, cache_key,
-            lambda: sampler.materialize_windows(
+        if backing == "memmap":
+            builder: Callable[[], WindowCache] = lambda: sampler.materialize_windows_memmap(
+                "train", training_seq_len, train_window_ids, memmap_dir, device
+            )
+        else:
+            builder = lambda: sampler.materialize_windows(
                 "train", training_seq_len, train_window_ids, frames_device, device
-            ),
-            maxsize=max(1, args.cache_memo_size),
-        )
+            )
+        train_cache = _memoize(_CACHE_MEMO, cache_key, builder, maxsize=max(1, args.cache_memo_size))
         cache_bytes = train_cache.nbytes()
+        prefetch = 0 if backing == "cuda" else max(0, args.prefetch_depth)
 
         def make_stream(seed: int):
-            return windowcache_batch_stream(train_cache, profile.batch_size, seed)
+            return windowcache_batch_stream(
+                train_cache, profile.batch_size, seed,
+                prefetch=prefetch, workers=max(1, args.prefetch_workers),
+            )
     else:
         def make_stream(seed: int):
             return training_batch_stream(
@@ -997,10 +1177,12 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         f"train_windows={len(train_window_ids):,} budget={budget:,} "
         f"(~{budget / steps_per_epoch:.1f} epochs) eval_interval={eval_interval:,}"
     )
-    print(
-        f"  window-cache: {cache_reason}"
-        + (f"  [{cache_bytes / 1e9:.1f} GB, {est_frames:,} unique frames]" if use_cache else "")
-    )
+    if use_cache:
+        where = "on disk" if backing == "memmap" else "resident"
+        print(f"  window-cache: {cache_reason}  [{cache_bytes / 1e9:.1f} GB {where}, "
+              f"{est_frames:,} unique frames, prefetch={prefetch}]")
+    else:
+        print(f"  window-cache: {cache_reason}")
 
     all_rows: list[dict[str, Any]] = []
     final_results: list[dict[str, Any]] = []
@@ -1022,9 +1204,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "window_cache": {
                 "used": bool(use_cache),
                 "reason": cache_reason,
+                "backing": backing,
                 "frames_device": str(frames_device) if use_cache else None,
                 "est_unique_frames": int(est_frames),
-                "resident_bytes": int(cache_bytes),
+                "bytes": int(cache_bytes),
+                "prefetch": int(prefetch),
             },
             "final_results": final_results,
         }
@@ -1083,14 +1267,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sigreg-num-proj", type=int, default=None, help="Override profile SIGReg projection count.")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
+    parser.add_argument("--num-threads", type=int, default=0, help="Torch intra-op threads (0 = auto: min(16, ncpu)).")
     parser.add_argument("--action-stats-samples", type=int, default=20000)
     parser.add_argument(
-        "--window-cache", choices=("auto", "gpu", "cpu", "off"), default="auto",
-        help="Resident decoded-window cache placement. auto: GPU if it fits the budget, "
-             "else CPU RAM, else stream from HDF5 (current behaviour).",
+        "--window-cache", choices=("auto", "gpu", "cpu", "memmap", "off"), default="auto",
+        help="Decoded-window cache placement. auto: GPU if it fits, else CPU RAM, else on-disk "
+             "memmap (page-cached), else stream from HDF5. off = always stream.",
     )
     parser.add_argument("--cache-max-gb", type=float, default=12.0, help="GPU VRAM budget for the window cache.")
     parser.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
+    parser.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
+    parser.add_argument(
+        "--memmap-dir", default=None,
+        help="Where the decoded-frame memmap files live (default: <data dir>/.framecache). "
+             "Reused across sweep points and reruns via a content hash.",
+    )
+    parser.add_argument(
+        "--prefetch-depth", type=int, default=3,
+        help="Minibatches read ahead on background threads (memmap/CPU tiers). 0 disables.",
+    )
+    parser.add_argument("--prefetch-workers", type=int, default=2, help="Background reader threads for prefetch.")
     parser.add_argument(
         "--cache-memo-size", type=int, default=2,
         help="How many resident caches to keep across sweep points (odLD varies seed -> 2).",

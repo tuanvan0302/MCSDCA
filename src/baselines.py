@@ -18,11 +18,16 @@ def make_baseline_optimizer(
     if not params:
         raise ValueError("Baseline optimizer requires at least one trainable parameter.")
 
+    # Fused foreach kernels: one launch for the whole param step instead of a
+    # Python loop. Stable for Adam/AdamW on CUDA and a clear win when the model
+    # is small (kernel-launch bound), which is the case here.
+    fused = {"fused": True} if params[0].is_cuda else {}
+
     key = "".join(char for char in name.lower() if char.isalnum())
     if key == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, **fused)
     if key == "adam":
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, **fused)
     if key in {"sgd", "sgdmomentum"}:
         return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
     if key == "rmsprop":

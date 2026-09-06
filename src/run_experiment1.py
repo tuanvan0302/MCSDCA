@@ -285,14 +285,19 @@ def build_parser_e1() -> argparse.ArgumentParser:
                    help="Comma list of seeds for the odLD coarse sweep (ranked on the seed mean). "
                         "Flow-test mode forces one seed.")
     p.add_argument("--profile", default="small", choices=tuple(TRAINING_PROFILES))
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--sigreg-num-proj", type=int, default=512)
-    p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    p.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--window-cache", choices=("auto", "gpu", "cpu", "off"), default="auto",
-                   help="Resident decoded-window cache: auto picks GPU/CPU-RAM by size, else streams from HDF5.")
+    p.add_argument("--num-threads", type=int, default=0, help="Torch intra-op threads (0 = auto: min(16, ncpu)).")
+    p.add_argument("--window-cache", choices=("auto", "gpu", "cpu", "memmap", "off"), default="auto",
+                   help="Decoded-window cache: auto picks GPU / CPU-RAM / on-disk memmap by size, else streams.")
     p.add_argument("--cache-max-gb", type=float, default=12.0, help="GPU VRAM budget for the window cache.")
     p.add_argument("--cache-ram-gb", type=float, default=80.0, help="Host RAM budget for the window cache.")
+    p.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
+    p.add_argument("--memmap-dir", default=None, help="Dir for decoded-frame memmaps (default <data dir>/.framecache).")
+    p.add_argument("--prefetch-depth", type=int, default=3, help="Minibatches read ahead on background threads (0 = off).")
+    p.add_argument("--prefetch-workers", type=int, default=2, help="Background reader threads for prefetch.")
     p.add_argument("--tune-budget", type=int, default=None, help="Backprop budget per sweep point (default 3000, flow 60).")
     p.add_argument("--eval-budget", type=int, default=None,
                    help="FIXED backprop budget for the final comparison, same at every fraction (default 8000, flow 120).")
@@ -329,11 +334,16 @@ def main() -> None:
         "data_fraction": frac,
         "device": args.device,
         "precision": args.precision,
+        "num_threads": args.num_threads,
         "batch_size": args.batch_size,
         "sigreg_num_proj": args.sigreg_num_proj,
         "window_cache": args.window_cache,
         "cache_max_gb": args.cache_max_gb,
         "cache_ram_gb": args.cache_ram_gb,
+        "cache_disk_gb": args.cache_disk_gb,
+        "memmap_dir": args.memmap_dir,
+        "prefetch_depth": args.prefetch_depth,
+        "prefetch_workers": args.prefetch_workers,
     }
 
     try:
