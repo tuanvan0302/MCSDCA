@@ -22,6 +22,10 @@ class MCSDCAConfig:
     ``epsilon`` as the RATIO epsilon/eta over {1e-6, 1e-2, 1e0} (see
     src/sweep.py), so the Langevin noise-to-signal regime is the knob rather
     than an eta-dependent absolute; ``ud_delta`` over {0.03, 0.1, 0.3}.
+
+    For a faithful, un-tuned reproduction use :meth:`paper` (long chains, the
+    paper's epsilon / step size / gamma schedule) with the ``paper`` training
+    profile.
     """
 
     langevin_steps: int = 5  # Base Markov-chain length n_k = base + floor((k+1)^power)
@@ -36,6 +40,41 @@ class MCSDCAConfig:
     od_eta: float = 3e-3  # Overdamped Langevin step size
     ud_delta: float = 0.1  # Underdamped Langevin step size
     max_grad_norm: float | None = 1.0
+
+    @classmethod
+    def paper(cls) -> "MCSDCAConfig":
+        """The paper's deep-learning setup, reproduced verbatim (no shortcuts).
+
+        From "Training procedure" (Chaudhari et al. 2019 local-entropy schedule):
+
+          * time  1/t = 1e-4  (t = 1e4); scoping exponent held at k = 1
+          * epsilon = 1e-8  (viscosity-vanishing regime)
+          * Langevin step size (Eq. 7) = 1e-3  -> od_eta (and ud_delta)
+          * chain length  n_k = 20 + floor((k+1)^0.1), NO cap; discard 10 states
+          * gamma_k = (1/t) * gamma_tilde_k  with  gamma_tilde_k = 1e-5 (k+1)^0.1,
+            hence gamma_0 = 1e-4 * 1e-5 = 1e-9 (stays in sync with t = 1e4 here);
+            with beta0 unset this reproduces gamma_k exactly.
+
+        Pairs with the ``paper`` training profile, whose AdamW baseline mirrors
+        le-wm/config/train/lewm.yaml (AdamW lr 5e-5 / wd 1e-3, bf16, batch 128,
+        grad-clip 1.0, 100 epochs, SIGReg weight 0.09 / knots 17 / num_proj 1024,
+        LinearWarmupCosineAnnealingLR).
+        """
+
+        return cls(
+            langevin_steps=20,
+            langevin_steps_power=0.1,
+            max_langevin_steps=None,
+            burn_in=10,
+            local_entropy_time=1e4,
+            gamma=1e-9,
+            gamma_power=0.1,
+            beta0=None,
+            epsilon=1e-8,
+            od_eta=1e-3,
+            ud_delta=1e-3,
+            max_grad_norm=1.0,
+        )
 
     def validate(self) -> None:
         if self.langevin_steps <= 0:

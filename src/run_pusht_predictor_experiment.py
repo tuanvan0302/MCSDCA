@@ -134,6 +134,24 @@ TRAINING_PROFILES: dict[str, TrainingProfile] = {
         sigreg_num_proj=1024,
         mcsdca=MCSDCAConfig(),
     ),
+    "paper": TrainingProfile(
+        # Faithful reproduction, no tuning. The AdamW baseline mirrors
+        # le-wm/config/train/lewm.yaml exactly: AdamW lr 5e-5 / wd 1e-3, bf16,
+        # batch 128, grad-clip 1.0, 100 epochs, SIGReg weight 0.09 / knots 17 /
+        # num_proj 1024, LinearWarmupCosineAnnealingLR (make_lewm_lr_scheduler).
+        # MCSDCA-odLD / -udLD use MCSDCAConfig.paper() (n_k = 20 + floor(k^0.1),
+        # discard 10, epsilon 1e-8, Langevin step 1e-3, gamma_k = (1/t) 1e-5 (k+1)^0.1).
+        data_fraction=1.0,
+        epochs=100,
+        batch_size=128,
+        eval_batch_size=8,
+        eval_train_batches=16,
+        val_batches=16,
+        precision="bf16",
+        sigreg_num_proj=1024,
+        gradient_clip_val=1.0,
+        mcsdca=MCSDCAConfig.paper(),
+    ),
 }
 
 

@@ -15,11 +15,18 @@ The only required argument is ``--data``: the PERCENT of the PushT training set
 to use (0.01, 1, 10, 50, 100 ...). Any value < 1 turns on FLOW-TEST MODE - tiny
 grids, tiny budgets, one seed - just to prove the pipeline runs.
 
+Passing ``--profile paper`` skips tuning entirely: the AdamW baseline is pinned
+to ``le-wm/config/train/lewm.yaml`` (lr 5e-5 / wd 1e-3, bf16, batch 128, 100
+epochs, SIGReg 0.09 / knots 17 / num_proj 1024) and MCSDCA-odLD / -udLD run at
+``MCSDCAConfig.paper()`` (n_k = 20 + floor(k^0.1), discard 10, epsilon 1e-8,
+Langevin step 1e-3). The eval budget becomes 100 * steps/epoch for every optimizer.
+
 Examples
 --------
     python src/run_experiment1.py --data 0.01
     python src/run_experiment1.py --data 10
     python src/run_experiment1.py --data 50 --reuse-winners outputs/experiment1/data10/winners.json
+    python src/run_experiment1.py --data 100 --profile paper   # faithful, un-tuned
 
 Defaults are tuned for the rented VM: Windows 10, i7-12700KF, 1x RTX 3090 (24 GB),
 56 GB RAM, NVMe SSD.
@@ -213,12 +220,20 @@ def stage_evaluate(common: dict, winners: dict, seeds: list[int], eval_budget: i
         args.backprop_budget = eval_budget
         args.eval_interval = max(1, eval_budget // 10)
         args.seed = seed
-        args.lr = winners["AdamW"]["lr"]
-        args.weight_decay = winners["AdamW"]["weight_decay"]
-        args.mcsdca_eta = winners["MCSDCA-odLD"]["mcsdca_eta"]
-        args.mcsdca_delta = winners["MCSDCA-udLD"]["mcsdca_delta"]
-        args.mcsdca_epsilon = winners["MCSDCA-odLD"]["mcsdca_epsilon"]
-        args.mcsdca_beta0 = winners["MCSDCA-odLD"]["mcsdca_beta0"]
+        args.lr = winners["AdamW"].get("lr", args.lr)
+        args.weight_decay = winners["AdamW"].get("weight_decay", args.weight_decay)
+        # Empty MCSDCA dicts (the `paper` preset) leave every knob unset, so
+        # resolve_mcsdca_config falls back to the profile's MCSDCAConfig.paper().
+        odld_cfg = winners.get("MCSDCA-odLD", {})
+        udld_cfg = winners.get("MCSDCA-udLD", {})
+        if odld_cfg.get("mcsdca_eta") is not None:
+            args.mcsdca_eta = odld_cfg["mcsdca_eta"]
+        if udld_cfg.get("mcsdca_delta") is not None:
+            args.mcsdca_delta = udld_cfg["mcsdca_delta"]
+        if odld_cfg.get("mcsdca_epsilon") is not None:
+            args.mcsdca_epsilon = odld_cfg["mcsdca_epsilon"]
+        if odld_cfg.get("mcsdca_beta0") is not None:
+            args.mcsdca_beta0 = odld_cfg["mcsdca_beta0"]
         args.output_dir = str(out_dir)
         args.run_id = f"seed{seed}"
         args.save_checkpoints = False
@@ -284,10 +299,14 @@ def build_parser_e1() -> argparse.ArgumentParser:
     p.add_argument("--tune-seeds", default="3072,3073",
                    help="Comma list of seeds for the odLD coarse sweep (ranked on the seed mean). "
                         "Flow-test mode forces one seed.")
-    p.add_argument("--profile", default="small", choices=tuple(TRAINING_PROFILES))
-    p.add_argument("--batch-size", type=int, default=64,
-                   help="Shared by all optimizers; MCSDCA's retained-sample chain is the VRAM limit (64 fits a 24 GB card).")
-    p.add_argument("--sigreg-num-proj", type=int, default=512)
+    p.add_argument("--profile", default="small", choices=tuple(TRAINING_PROFILES),
+                   help="`small` (10%% grid-tuned, batch 64) or `paper` (faithful, un-tuned: "
+                        "AdamW = le-wm/config/train/lewm.yaml, MCSDCA = MCSDCAConfig.paper(), batch 128, 100 epochs).")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Override the profile batch size (default: profile's - 64 for `small`, 128 for `paper`). "
+                        "MCSDCA's retained-sample chain is the VRAM limit.")
+    p.add_argument("--sigreg-num-proj", type=int, default=None,
+                   help="Override the profile SIGReg projection count (default: profile's - 512 `small`, 1024 `paper`).")
     p.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     p.add_argument("--device", default="cuda")
     p.add_argument("--num-threads", type=int, default=0, help="Torch intra-op threads (0 = auto: min(16, ncpu)).")
@@ -321,10 +340,10 @@ def main() -> None:
 
     frac = args.data / 100.0
     flow = args.data < 1.0
+    paper_preset = args.profile == "paper"
     grids = FLOW_GRIDS if flow else REAL_GRIDS
     excludes = FLOW_EXCLUDES if flow else REAL_EXCLUDES
     tune_budget = args.tune_budget or (60 if flow else 3000)
-    eval_budget = args.eval_budget or (120 if flow else 8000)
     sanity_budget = 20 if flow else 40
     seeds = [args.tune_seed] if flow else [int(s) for s in args.seeds.split(",") if s.strip()]
     tune_seeds = ([args.tune_seed] if flow
@@ -339,8 +358,6 @@ def main() -> None:
         "device": args.device,
         "precision": args.precision,
         "num_threads": args.num_threads,
-        "batch_size": args.batch_size,
-        "sigreg_num_proj": args.sigreg_num_proj,
         "window_cache": args.window_cache,
         "cache_max_gb": args.cache_max_gb,
         "cache_gpu_reserve_gb": args.cache_gpu_reserve_gb,
@@ -350,27 +367,51 @@ def main() -> None:
         "prefetch_depth": args.prefetch_depth,
         "prefetch_workers": args.prefetch_workers,
     }
+    # Leave batch / SIGReg-proj unset unless overridden, so the training profile
+    # decides (the `paper` profile pins 128 / 1024; `small` keeps 64 / 512).
+    if args.batch_size is not None:
+        common["batch_size"] = args.batch_size
+    if args.sigreg_num_proj is not None:
+        common["sigreg_num_proj"] = args.sigreg_num_proj
 
+    prof = TRAINING_PROFILES[args.profile]
+    resolved_batch = args.batch_size or prof.batch_size
     try:
-        n_windows, spe = steps_per_epoch(data_path, args.profile, frac, args.batch_size, args.tune_seed)
-        epochs_equiv = f"{eval_budget / spe:.2f}"
+        n_windows, spe = steps_per_epoch(data_path, args.profile, frac, resolved_batch, args.tune_seed)
     except Exception as exc:  # noqa: BLE001 - informational only
-        n_windows, spe, epochs_equiv = -1, -1, f"? ({exc!r})"
+        n_windows, spe = -1, -1
+        if paper_preset and not args.eval_budget:
+            raise SystemExit(
+                f"[experiment1] --profile paper sizes its budget as {prof.epochs} * steps/epoch, "
+                f"which needs a readable dataset ({exc!r}). Pass --eval-budget to override."
+            )
+
+    if args.eval_budget:
+        eval_budget = args.eval_budget
+    elif paper_preset:
+        eval_budget = spe * prof.epochs
+    else:
+        eval_budget = 120 if flow else 8000
+    epochs_equiv = f"{eval_budget / spe:.2f}" if spe > 0 else f"? ({eval_budget} backprop)"
 
     print("=" * 78)
     print(f"Experiment 1  |  data={args.data}%  (fraction={frac:g})  "
           f"{'FLOW-TEST MODE' if flow else 'real run'}")
-    print(f"  profile={args.profile} batch={args.batch_size} precision={args.precision} "
-          f"device={args.device} sigreg_num_proj={args.sigreg_num_proj}")
+    print(f"  profile={args.profile} batch={resolved_batch} precision={args.precision} "
+          f"device={args.device} sigreg_num_proj={args.sigreg_num_proj or prof.sigreg_num_proj}")
     print(f"  train windows ~= {n_windows:,}  steps/epoch ~= {spe:,}")
-    n_odld = grid_size(grids["odld"], excludes["odld"])
-    n_udld = grid_size(grids["udld"], excludes["udld"])
-    n_adamw = grid_size(grids["adamw"], excludes["adamw"])
-    print(f"  tune  : {n_odld} odLD x {len(tune_seeds)} seed(s) {tune_seeds} "
-          f"+ {n_udld} udLD + {n_adamw} AdamW @ seed {args.tune_seed}, "
-          f"{tune_budget} backprop each")
-    print(f"  eval  : {OPTIMIZERS} x seeds {seeds} @ FIXED {eval_budget} backprop "
-          f"(~{epochs_equiv} epochs-equiv)")
+    if paper_preset:
+        print("  tune  : SKIPPED (preset=paper -> AdamW = le-wm/config/train/lewm.yaml, "
+              "MCSDCA = MCSDCAConfig.paper())")
+    else:
+        n_odld = grid_size(grids["odld"], excludes["odld"])
+        n_udld = grid_size(grids["udld"], excludes["udld"])
+        n_adamw = grid_size(grids["adamw"], excludes["adamw"])
+        print(f"  tune  : {n_odld} odLD x {len(tune_seeds)} seed(s) {tune_seeds} "
+              f"+ {n_udld} udLD + {n_adamw} AdamW @ seed {args.tune_seed}, "
+              f"{tune_budget} backprop each")
+    print(f"  eval  : {OPTIMIZERS} x seeds {seeds} @ {'100-epoch' if paper_preset else 'FIXED'} "
+          f"{eval_budget} backprop (~{epochs_equiv} epochs-equiv)")
     print(f"  out   : {out_dir}")
     if args.reuse_winners:
         print(f"  winners: reuse {args.reuse_winners} (tuning skipped)")
@@ -389,6 +430,23 @@ def main() -> None:
         if not winners_path.exists():
             raise SystemExit(f"--only eval needs {winners_path} or --reuse-winners.")
         winners = json.loads(winners_path.read_text(encoding="utf-8"))["winners"]
+    elif paper_preset:
+        # No tuning. AdamW is pinned to le-wm/config/train/lewm.yaml; the empty
+        # MCSDCA dicts make stage_evaluate add no overrides, so odLD / udLD run
+        # at the profile's MCSDCAConfig.paper().
+        winners = {
+            "AdamW": {"lr": 5e-5, "weight_decay": 1e-3},
+            "MCSDCA-odLD": {},
+            "MCSDCA-udLD": {},
+        }
+        winners_path.write_text(json.dumps({
+            "data_percent": args.data, "data_fraction": frac, "flow_test": flow,
+            "profile": args.profile, "preset": "paper", "tune_seed": None,
+            "tune_seeds": [], "tune_budget": None, "winners": winners,
+        }, indent=2), encoding="utf-8")
+        print("[experiment1] preset=paper - tuning skipped")
+        print(f"    AdamW: {winners['AdamW']}  (le-wm/config/train/lewm.yaml)")
+        print("    MCSDCA-odLD / -udLD: MCSDCAConfig.paper()\n")
     else:
         if not args.skip_sanity:
             stage_sanity(common, args.tune_seed, sanity_budget, out_dir)
