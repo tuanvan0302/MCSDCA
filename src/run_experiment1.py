@@ -323,7 +323,11 @@ def build_parser_e1() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-workers", type=int, default=2, help="Background reader threads for prefetch.")
     p.add_argument("--tune-budget", type=int, default=None, help="Backprop budget per sweep point (default 3000, flow 60).")
     p.add_argument("--eval-budget", type=int, default=None,
-                   help="FIXED backprop budget for the final comparison, same at every fraction (default 8000, flow 120).")
+                   help="FIXED backprop budget for the final comparison, same at every fraction (default 8000, flow 120). "
+                        "With --profile paper, overrides the epoch-based budget entirely.")
+    p.add_argument("--paper-epochs", type=int, default=100,
+                   help="--profile paper only: budget = this * steps/epoch for every optimizer "
+                        "(default 100 = le-wm; the MCSDCA paper itself uses 40). Ignored if --eval-budget is set.")
     p.add_argument("--reuse-winners", default=None, help="Path to a winners.json; skips all tuning.")
     p.add_argument("--only", choices=("all", "tune", "eval"), default="all")
     p.add_argument("--skip-sanity", action="store_true")
@@ -389,7 +393,7 @@ def main() -> None:
     if args.eval_budget:
         eval_budget = args.eval_budget
     elif paper_preset:
-        eval_budget = spe * prof.epochs
+        eval_budget = spe * max(1, args.paper_epochs)
     else:
         eval_budget = 120 if flow else 8000
     epochs_equiv = f"{eval_budget / spe:.2f}" if spe > 0 else f"? ({eval_budget} backprop)"
@@ -410,7 +414,8 @@ def main() -> None:
         print(f"  tune  : {n_odld} odLD x {len(tune_seeds)} seed(s) {tune_seeds} "
               f"+ {n_udld} udLD + {n_adamw} AdamW @ seed {args.tune_seed}, "
               f"{tune_budget} backprop each")
-    print(f"  eval  : {OPTIMIZERS} x seeds {seeds} @ {'100-epoch' if paper_preset else 'FIXED'} "
+    budget_kind = f"{args.paper_epochs}-epoch" if (paper_preset and not args.eval_budget) else "FIXED"
+    print(f"  eval  : {OPTIMIZERS} x seeds {seeds} @ {budget_kind} "
           f"{eval_budget} backprop (~{epochs_equiv} epochs-equiv)")
     print(f"  out   : {out_dir}")
     if args.reuse_winners:
