@@ -84,35 +84,5 @@ def finite_or_raise(loss: torch.Tensor, name: str = "loss") -> None:
         raise FloatingPointError(f"{name} is not finite: {float(loss.detach().cpu())}")
 
 
-def clip_grads(grads: TensorList, max_norm: float | None) -> TensorList:
-    if max_norm is None:
-        return grads
-
-    total_sq = torch.zeros((), device=grads[0].device)
-    for grad in grads:
-        total_sq = total_sq + grad.detach().pow(2).sum()
-    total_norm = torch.sqrt(total_sq)
-
-    if total_norm <= max_norm:
-        return grads
-
-    scale = max_norm / (float(total_norm.detach().cpu()) + 1e-12)
-    return [grad * scale for grad in grads]
-
-
-def noise_like(values: TensorList, scale: float) -> TensorList:
-    if scale == 0.0:
-        return zero_like(values)
-    return [scale * torch.randn_like(value) for value in values]
-
-
-def assert_same_shapes(left: TensorList, right: TensorList) -> None:
-    if len(left) != len(right):
-        raise ValueError("Parameter lists have different lengths.")
-    for lhs, rhs in zip(left, right, strict=True):
-        if lhs.shape != rhs.shape:
-            raise ValueError(f"Shape mismatch: {tuple(lhs.shape)} != {tuple(rhs.shape)}")
-
-
 def stable_sqrt(value: float) -> float:
     return math.sqrt(max(value, 0.0))

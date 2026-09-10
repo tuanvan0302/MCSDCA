@@ -1,14 +1,23 @@
 # Kịch bản thử nghiệm 1 — Dùng MCSDCA làm optimizer cho LeWM
 
+> ⚠️ **ĐÃ LỖI THỜI (2026-09).** Toàn bộ phần dò tham số (tuning) đã bị gỡ bỏ.
+> Giờ chỉ còn **một** cách chạy, mọi tham số nằm trong `configs/experiment1.yaml`
+> (= giá trị 2 paper, KHÔNG tune):
+>
+> ```text
+> python src/run_experiment1.py                    # quét data.fractions × seed từ YAML
+> python src/run_experiment1.py --only-fraction 0.04
+> python src/run_experiment1.py --set train.budget=400 --set 'seed=[3072]'   # smoke
+> ```
+>
+> Đã xoá: `src/sweep.py`, `src/run_ablation.py`, `src/smoke_test_predictor.py`,
+> `configs/sweep/`, `configs/ablation.yaml`, `winners.json`, các cờ `--data` /
+> `--profile` / `--reuse-winners`. Phần bên dưới giữ lại để tham khảo lịch sử.
+
+---
+
 > File này thay cho `EXPERIMENT_PLAN.txt` cũ. Bản `.txt` nói về việc train model
 > LeWM gốc bằng `le-wm/train.py` — đó là việc khác, không nằm trong thử nghiệm này.
-
-Có **2 cách chạy**:
-
-| Cách | Dùng khi nào | Lệnh |
-|---|---|---|
-| **Nhanh — 1 lệnh** | chạy cả pipeline (dò tham số + đánh giá) cho một mức dữ liệu | `python src/run_experiment1.py --data <phần_trăm>` |
-| **Thủ công — nhiều bước** | muốn kiểm soát từng bước dò tham số (thô → tinh → xác nhận) | `python src/sweep.py configs/sweep/<bước>.yaml` rồi `python src/run_ablation.py configs/ablation.yaml` |
 
 3 script gốc:
 

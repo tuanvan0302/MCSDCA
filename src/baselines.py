@@ -28,12 +28,5 @@ def make_baseline_optimizer(
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, **fused)
     if key == "adam":
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, **fused)
-    if key in {"sgd", "sgdmomentum"}:
-        return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
-    if key == "rmsprop":
-        return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
-    if key == "adagrad":
-        return torch.optim.Adagrad(params, lr=lr, weight_decay=weight_decay)
 
-    supported = "AdamW, Adam, SGD + momentum, RMSprop, Adagrad"
-    raise ValueError(f"Unsupported optimizer '{name}'. Supported: {supported}.")
+    raise ValueError(f"Unsupported baseline optimizer '{name}'. Supported: AdamW, Adam.")

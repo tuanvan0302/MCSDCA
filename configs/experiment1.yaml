@@ -1,0 +1,120 @@
+# Experiment 1 -- single source of truth. NO tuning: every value below is fixed
+# from the two papers.
+#   * AdamW baseline + SIGReg  : le-wm/config/train/lewm.yaml
+#   * MCSDCA-odLD / -udLD       : MCSDCA paper "Training procedure" (Chaudhari
+#     et al. 2019 local-entropy schedule) -- see src/mcsdca/config.py
+#
+# Override any leaf from the CLI:  --set train.budget=400  --set data.fractions=[0.0001]
+# Driver: src/run_experiment1.py  (sweeps data.fractions x seed, aggregates).
+
+seed: [3072, 3073, 3074]
+
+data:
+  path: data/pusht_expert_train.h5
+  fractions: [0.1, 0.01, 0.001]   # 10%, 0.1%, 0.01% -- run one after another
+  train_fraction: 0.9                # episode-level train/val split
+  val_eval_fraction: 0.15            # fraction of val windows kept for evaluation
+  action_stats_samples: 20000
+
+# LeWM model, instantiated with hydra (_target_ style). Inlined from the old
+# configs/lewm_pusht.json so the whole experiment is one file.
+model:
+  _target_: stable_worldmodel.wm.lewm.LeWM
+  encoder:
+    _target_: stable_pretraining.backbone.utils.vit_hf
+    size: tiny
+    patch_size: 14
+    image_size: 224
+    pretrained: false
+    use_mask_token: false
+  predictor:
+    _target_: stable_worldmodel.wm.lewm.module.Predictor
+    num_frames: 3
+    input_dim: 192
+    hidden_dim: 192
+    output_dim: 192
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+  action_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.Embedder
+    input_dim: 10
+    emb_dim: 192
+  projector:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: 192
+    output_dim: 192
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+  pred_proj:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: 192
+    output_dim: 192
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+
+train:
+  precision: bf16
+  batch_size: 128
+  history_size: 3
+  num_preds: 1
+  frameskip: 5
+  epochs: 40                 # budget = epochs * steps_per_epoch  (MCSDCA paper: 40 * N)
+  budget: null               # null => epochs * steps_per_epoch; an int pins it directly
+  eval_every_epochs: 1       # eval cadence in epochs; null => fall back to eval_interval_frac
+  eval_interval_frac: 0.1    # used only when eval_every_epochs is null
+  early_stop:                # MCSDCA paper: stop if val loss doesn't improve for N consecutive epochs
+    enabled: true
+    patience_evals: 4        # = 4 epochs when eval_every_epochs = 1
+    min_delta: 0.0           # improvement smaller than this counts as "no improvement"
+  gradient_clip_val: 1.0     # AdamW baseline ONLY (le-wm). MCSDCA never clips (see src/mcsdca).
+  adamw:
+    lr: 5.0e-5
+    weight_decay: 1.0e-3
+
+loss:
+  sigreg:                    # le-wm/config/train/lewm.yaml
+    weight: 0.09
+    knots: 17
+    num_proj: 1024
+
+mcsdca:                      # = MCSDCAConfig.paper() -- keep in sync with src/mcsdca/config.py
+  langevin_steps: 20         # n_k = langevin_steps + floor((k+1)^langevin_steps_power)
+  langevin_steps_power: 0.1
+  max_langevin_steps: null   # no cap (per paper)
+  burn_in: 10                # discard the first 10 chain states
+  local_entropy_time: 1.0e4  # t  (1/t = 1e-4)
+  gamma: 1.0e-9              # gamma_0 = (1/t) * 1e-5
+  gamma_power: 0.1
+  beta0: null                # unset => gamma schedule above drives gamma_k
+  epsilon: 1.0e-8            # Langevin temperature / PDE viscosity
+  od_eta: 1.0e-3             # overdamped Langevin step size
+  ud_delta: 1.0e-3           # underdamped Langevin step size
+
+eval:
+  batch_size: 8
+  train_batches: 16
+  val_batches: 16
+
+cache:                       # decoded-window cache (data-loading only; no effect on results)
+  mode: auto                 # auto | gpu | cpu | memmap | off
+  max_gb: 6.0
+  gpu_reserve_gb: 14.0
+  ram_gb: 0.0                # 0 => auto (0.6x free RAM)
+  disk_gb: 3000.0
+  memmap_dir: null
+  prefetch_depth: 3
+  prefetch_workers: 2
+  memo_size: 2
+
+device: auto                 # auto | cpu | cuda | cuda:N
+num_threads: 0               # torch intra-op threads (0 => auto)
+save_checkpoints: false
+optimizers: [AdamW, MCSDCA-odLD, MCSDCA-udLD]

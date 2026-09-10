@@ -27,12 +27,15 @@ patch_multiprocess_resource_tracker()
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from src.run_pusht_predictor_experiment import (
+    DEFAULT_CONFIG,
     IMAGE_MEAN,
     IMAGE_STD,
     PushTHDF5Sampler,
     initialize_lewm,
+    load_config,
 )
 
 ROLLOUT_MAX_SEQ_LEN = 8  # history_size (3) + max rollout horizon (5)
@@ -173,7 +176,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sampler = PushTHDF5Sampler(
         data_path, args.frameskip, ROLLOUT_MAX_SEQ_LEN, args.action_stats_samples, args.seed, args.train_fraction
     )
-    model, _ = initialize_lewm(Path(args.model_config).resolve(), device)
+    model_cfg = OmegaConf.to_container(load_config(args.config).model, resolve=True)
+    model, _ = initialize_lewm(model_cfg, device)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -197,7 +201,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PushT MPC/CEM planning for a trained LeWM checkpoint.")
     parser.add_argument("--checkpoint", required=True, help="Path to a *_full_model.pt state dict.")
-    parser.add_argument("--model-config", default=str(ROOT / "configs" / "lewm_pusht.json"))
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Experiment YAML (for the model block).")
     parser.add_argument("--data-path", default=str(ROOT / "data" / "pusht_expert_train.h5"))
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=3072)

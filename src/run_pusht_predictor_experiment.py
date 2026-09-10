@@ -1,12 +1,18 @@
-"""Train and evaluate MCSDCA-odLD / MCSDCA-udLD against baseline optimizers as a
-full-model LeWM PushT predictor optimizer.
+"""Engine: train and evaluate MCSDCA-odLD / MCSDCA-udLD against an AdamW baseline
+as a full-model LeWM PushT predictor optimizer.
 
 All five LeWM modules (encoder, projector, action_encoder, predictor, pred_proj)
 are initialized from scratch and trained jointly on
 ``prediction MSE + sigreg_weight * SIGReg`` (the LeWM objective). Every optimizer
-gets the same initial weights, the same batch stream, and the same *backprop
-budget* (number of backward passes), so results are compared on the
-``backprop_calls`` axis. Planning/CEM evaluation lives in ``evaluate_planning.py``.
+gets the same initial weights and the same batch stream. The training budget is
+``epochs * steps_per_epoch`` backward passes (the MCSDCA paper's ``40 * N`` when
+``epochs = 40``); MCSDCA spends ``~n_k`` of those per outer step.
+
+Every knob comes from a single YAML (``configs/experiment1.yaml``) -- there is no
+tuning. ``src/run_experiment1.py`` is the driver that sweeps data fractions x
+seeds; this module's ``main()`` runs one (fraction, seed). Results land in
+``outputs/<dataTAG>/<stamp>__seed<seed>/`` (one fresh folder per run, never
+overwritten). Planning/CEM evaluation lives in ``evaluate_planning.py``.
 """
 
 from __future__ import annotations
@@ -26,9 +32,10 @@ import warnings
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,18 +65,18 @@ from src.mcsdca import MCSDCAConfig, MCSDCAOdLD, MCSDCAUdLD
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
 ROLLOUT_HORIZONS = (1, 3, 5)
-BASELINE_OPTIMIZERS = ("AdamW", "Adam", "SGD + momentum", "RMSprop", "Adagrad")
+BASELINE_OPTIMIZERS = ("AdamW", "Adam")
 MCSDCA_OPTIMIZERS = ("MCSDCA-odLD", "MCSDCA-udLD")
 DEFAULT_OPTIMIZERS = ("AdamW", "MCSDCA-odLD", "MCSDCA-udLD")
 
 
 # --------------------------------------------------------------------------- #
-# Training profiles                                                            #
+# Training profile (one instance, built from the YAML config)                  #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class TrainingProfile:
     data_fraction: float
-    epochs: int  # only used to derive the default backprop budget
+    epochs: int  # budget = epochs * steps_per_epoch (MCSDCA paper's 40*N at epochs=40)
     batch_size: int
     eval_batch_size: int
     eval_train_batches: int
@@ -80,111 +87,114 @@ class TrainingProfile:
     history_size: int = 3
     num_preds: int = 1
     frameskip: int = 5
-    gradient_clip_val: float = 1.0
+    gradient_clip_val: float = 1.0  # AdamW baseline only (le-wm/config/train/lewm.yaml); MCSDCA never clips
     train_fraction: float = 0.9  # episode-level train/val split
     val_eval_fraction: float = 0.15  # fraction of val windows kept for evaluation
     default_budget: int | None = None  # overrides steps_per_epoch * epochs when set
 
 
-TRAINING_PROFILES: dict[str, TrainingProfile] = {
-    "smoke": TrainingProfile(
-        data_fraction=0.02,
-        epochs=1,
-        batch_size=8,
-        eval_batch_size=4,
-        eval_train_batches=2,
-        val_batches=2,
-        precision="fp32",
-        sigreg_num_proj=64,
-        default_budget=40,
-        mcsdca=MCSDCAConfig(langevin_steps=3, langevin_steps_power=0.25, max_langevin_steps=4, burn_in=1),
-    ),
-    "small": TrainingProfile(
-        # Tuned for a single RTX 3090 (24 GB): batch 64 + 512 SIGReg projections
-        # fit comfortably in fp32; more eval batches keep the ranking signal clean.
-        data_fraction=0.10,
-        epochs=10,
-        batch_size=64,
-        eval_batch_size=8,
-        eval_train_batches=16,
-        val_batches=16,
-        precision="fp32",
-        sigreg_num_proj=512,
-        mcsdca=MCSDCAConfig(),
-    ),
-    "medium": TrainingProfile(
-        data_fraction=0.50,
-        epochs=30,
-        batch_size=64,
-        eval_batch_size=4,
-        eval_train_batches=16,
-        val_batches=16,
-        precision="bf16",
-        sigreg_num_proj=512,
-        mcsdca=MCSDCAConfig(),
-    ),
-    "full": TrainingProfile(
-        data_fraction=1.0,
-        epochs=100,
-        batch_size=128,
-        eval_batch_size=8,
-        eval_train_batches=16,
-        val_batches=16,
-        precision="bf16",
-        sigreg_num_proj=1024,
-        mcsdca=MCSDCAConfig(),
-    ),
-    "paper": TrainingProfile(
-        # Faithful reproduction, no tuning. The AdamW baseline mirrors
-        # le-wm/config/train/lewm.yaml exactly: AdamW lr 5e-5 / wd 1e-3, bf16,
-        # batch 128, grad-clip 1.0, 100 epochs, SIGReg weight 0.09 / knots 17 /
-        # num_proj 1024, LinearWarmupCosineAnnealingLR (make_lewm_lr_scheduler).
-        # MCSDCA-odLD / -udLD use MCSDCAConfig.paper() (n_k = 20 + floor(k^0.1),
-        # discard 10, epsilon 1e-8, Langevin step 1e-3, gamma_k = (1/t) 1e-5 (k+1)^0.1).
-        data_fraction=1.0,
-        epochs=100,
-        batch_size=128,
-        eval_batch_size=8,
-        eval_train_batches=16,
-        val_batches=16,
-        precision="bf16",
-        sigreg_num_proj=1024,
-        gradient_clip_val=1.0,
-        mcsdca=MCSDCAConfig.paper(),
-    ),
-}
+def mcsdca_config_from_cfg(cfg: Any) -> MCSDCAConfig:
+    """Build the MCSDCA config straight from the YAML ``mcsdca:`` block."""
+
+    m = cfg.mcsdca
+    out = MCSDCAConfig(
+        langevin_steps=int(m.langevin_steps),
+        langevin_steps_power=float(m.langevin_steps_power),
+        max_langevin_steps=(None if m.max_langevin_steps in (None, "null") else int(m.max_langevin_steps)),
+        burn_in=int(m.burn_in),
+        local_entropy_time=float(m.local_entropy_time),
+        gamma=float(m.gamma),
+        gamma_power=float(m.gamma_power),
+        beta0=(None if m.beta0 in (None, "null") else float(m.beta0)),
+        epsilon=float(m.epsilon),
+        od_eta=float(m.od_eta),
+        ud_delta=float(m.ud_delta),
+    )
+    out.validate()
+    return out
 
 
-def resolve_profile(args: argparse.Namespace) -> TrainingProfile:
-    base = TRAINING_PROFILES[args.training_profile]
-    overrides: dict[str, Any] = {}
-    if args.data_fraction is not None:
-        overrides["data_fraction"] = args.data_fraction
-    if args.precision is not None:
-        overrides["precision"] = args.precision
-    if args.batch_size is not None:
-        overrides["batch_size"] = args.batch_size
-    if args.sigreg_num_proj is not None:
-        overrides["sigreg_num_proj"] = args.sigreg_num_proj
-    return replace(base, **overrides) if overrides else base
+def profile_from_args(args: Any) -> TrainingProfile:
+    """Build the single TrainingProfile from a flattened run-args namespace."""
+
+    budget = getattr(args, "budget", None)
+    return TrainingProfile(
+        data_fraction=float(args.data_fraction),
+        epochs=int(args.epochs),
+        batch_size=int(args.batch_size),
+        eval_batch_size=int(args.eval_batch_size),
+        eval_train_batches=int(args.eval_train_batches),
+        val_batches=int(args.val_batches),
+        precision=str(args.precision),
+        sigreg_num_proj=int(args.sigreg_num_proj),
+        mcsdca=args.mcsdca_config,
+        history_size=int(args.history_size),
+        num_preds=int(args.num_preds),
+        frameskip=int(args.frameskip),
+        gradient_clip_val=float(args.gradient_clip_val),
+        train_fraction=float(args.train_fraction),
+        val_eval_fraction=float(args.val_eval_fraction),
+        default_budget=(None if budget in (None, "null") else int(budget)),
+    )
 
 
-def resolve_mcsdca_config(base: MCSDCAConfig, args: argparse.Namespace) -> MCSDCAConfig:
-    overrides: dict[str, Any] = {}
-    for attr, key in (
-        ("mcsdca_epsilon", "epsilon"),
-        ("mcsdca_eta", "od_eta"),
-        ("mcsdca_delta", "ud_delta"),
-        ("mcsdca_beta0", "beta0"),
-        ("mcsdca_langevin_steps", "langevin_steps"),
-        ("mcsdca_burn_in", "burn_in"),
-    ):
-        value = getattr(args, attr)
-        if value is not None:
-            overrides[key] = value
-    cfg = replace(base, **overrides) if overrides else base
-    cfg.validate()
-    return cfg
+def build_run_args(cfg: Any, *, data_fraction: float, seed: int) -> SimpleNamespace:
+    """Flatten the merged YAML config into the namespace ``run()`` consumes for
+    one (data_fraction, seed). Keeps the data-loading / cache fields verbatim."""
+
+    t, e, c = cfg.train, cfg.eval, cfg.cache
+    device = str(cfg.device)
+    return SimpleNamespace(
+        # data / model
+        data_path=str(cfg.data.path),
+        model=OmegaConf.to_container(cfg.model, resolve=True),
+        data_fraction=float(data_fraction),
+        seed=int(seed),
+        device=device,
+        num_threads=int(cfg.num_threads),
+        action_stats_samples=int(cfg.data.action_stats_samples),
+        train_fraction=float(cfg.data.train_fraction),
+        val_eval_fraction=float(cfg.data.val_eval_fraction),
+        # training profile knobs
+        epochs=int(t.epochs),
+        budget=(None if t.budget in (None, "null") else int(t.budget)),
+        batch_size=int(t.batch_size),
+        precision=str(t.precision),
+        history_size=int(t.history_size),
+        num_preds=int(t.num_preds),
+        frameskip=int(t.frameskip),
+        gradient_clip_val=float(t.gradient_clip_val),
+        eval_batch_size=int(e.batch_size),
+        eval_train_batches=int(e.train_batches),
+        val_batches=int(e.val_batches),
+        eval_interval=None,
+        eval_interval_frac=float(t.eval_interval_frac),
+        eval_every_epochs=(None if t.eval_every_epochs in (None, "null") else int(t.eval_every_epochs)),
+        early_stop_enabled=bool(t.early_stop.enabled),
+        early_stop_patience=int(t.early_stop.patience_evals),
+        early_stop_min_delta=float(t.early_stop.min_delta),
+        # optimizers
+        optimizers=list(cfg.optimizers),
+        lr=float(t.adamw.lr),
+        weight_decay=float(t.adamw.weight_decay),
+        sigreg_weight=float(cfg.loss.sigreg.weight),
+        sigreg_num_proj=int(cfg.loss.sigreg.num_proj),
+        sigreg_knots=int(cfg.loss.sigreg.knots),
+        mcsdca_config=mcsdca_config_from_cfg(cfg),
+        config_yaml=OmegaConf.to_yaml(cfg),  # verbatim snapshot -> written into each run folder
+        # window cache (unchanged semantics)
+        window_cache=str(c.mode),
+        cache_max_gb=float(c.max_gb),
+        cache_gpu_reserve_gb=float(c.gpu_reserve_gb),
+        cache_ram_gb=float(c.ram_gb),
+        cache_disk_gb=float(c.disk_gb),
+        memmap_dir=(None if c.memmap_dir in (None, "null") else str(c.memmap_dir)),
+        prefetch_depth=int(c.prefetch_depth),
+        prefetch_workers=int(c.prefetch_workers),
+        cache_memo_size=int(c.memo_size),
+        # io
+        save_checkpoints=bool(cfg.save_checkpoints),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -201,36 +211,29 @@ def require_hdf5() -> Any:
     return h5py
 
 
-def read_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def optimizer_key(name: str) -> str:
     return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
-def parse_optimizers(value: str) -> list[str]:
+def parse_optimizers(value: Any) -> list[str]:
     names = [*BASELINE_OPTIMIZERS, *MCSDCA_OPTIMIZERS]
-    if value.strip().lower() == "all":
-        return list(names)
     aliases = {optimizer_key(name): name for name in names}
+    raw_list = value if isinstance(value, (list, tuple)) else str(value).split(",")
     selected: list[str] = []
-    for raw in value.split(","):
-        key = optimizer_key(raw.strip())
+    for raw in raw_list:
+        key = optimizer_key(str(raw).strip())
         if key not in aliases:
-            raise ValueError(f"Unsupported optimizer '{raw}'. Options: all, {', '.join(names)}")
+            raise ValueError(f"Unsupported optimizer '{raw}'. Options: {', '.join(names)}")
         selected.append(aliases[key])
     return selected
 
 
-def initialize_lewm(config_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict[str, Any]]:
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing LeWM model config: {config_path}")
-    config = read_json(config_path)
-    model = instantiate(OmegaConf.create(config)).to(device)
+def initialize_lewm(model_cfg: dict[str, Any], device: torch.device) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Instantiate the LeWM model from an inline (``_target_``-style) config dict."""
+
+    model = instantiate(OmegaConf.create(model_cfg)).to(device)
     enable_full_model_training(model)
-    return model, config
+    return model, model_cfg
 
 
 def clone_cpu_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -763,7 +766,7 @@ def resolve_cache_placement(
         if mode == "cpu":
             return False, cpu, "none", (
                 f"streaming fallback (~{est_gb:.1f} GB > {ram_cap:.1f} GB RAM cap; "
-                f"try --window-cache memmap or a smaller --data)"
+                f"try cache.mode=memmap or a smaller data.fractions)"
             )
 
     if mode in ("auto", "memmap"):
@@ -783,7 +786,7 @@ def resolve_cache_placement(
             )
         return False, cpu, "none", (
             f"streaming fallback (~{est_gb:.1f} GB > RAM and disk caps; "
-            f"raise --cache-ram-gb / --cache-disk-gb or use a smaller --data)"
+            f"raise cache.ram_gb / cache.disk_gb or use a smaller data.fractions)"
         )
 
     return False, cpu, "none", f"streaming (mode={mode}, device={compute_device.type})"
@@ -863,7 +866,68 @@ def rollout_stats(model: torch.nn.Module, batch: dict[str, torch.Tensor], histor
         "latent_norm_drift": float((pred.norm(dim=-1).mean() - target_norm).cpu()),
         "target_latent_norm": float(target_norm.cpu()),
         "pred_latent_variance": float(pred.var(dim=(0, 1), unbiased=False).mean().cpu()),
+        **_predictor_collapse(pred, target, prefix="roll_"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Representation-collapse diagnostics (encoder side vs predictor side)         #
+#                                                                             #
+# The LeWM objective has NO stop-gradient on the target, so SIGReg alone      #
+# resists collapse. These indicators localise a collapse:                     #
+#   * enc_* low  (emb variance/std/norm tiny, many dead dims) => ENCODER      #
+#     representation itself has shrunk.                                        #
+#   * enc_* healthy but pred_target_var_ratio << 1 => the PREDICTOR output    #
+#     collapsed to a near-constant while the target is still expressive.      #
+#   * both low => encoder collapse dragging the predictor with it.            #
+# --------------------------------------------------------------------------- #
+def _flat(x: torch.Tensor) -> torch.Tensor:
+    return x.reshape(-1, x.shape[-1]).float()
+
+
+def _predictor_collapse(pred: torch.Tensor, target: torch.Tensor, prefix: str = "") -> dict[str, float]:
+    p, t = _flat(pred), _flat(target)
+    pv = float(p.var(dim=0, unbiased=False).mean())
+    tv = float(t.var(dim=0, unbiased=False).mean())
+    pn = float(p.norm(dim=-1).mean())
+    tn = float(t.norm(dim=-1).mean())
+    # Ratio ~1 = healthy; << 1 = the predictor output collapsed relative to the
+    # (still expressive) target. Capped at 10 so the "< 1" regime stays readable
+    # even when the target itself has collapsed (then trust enc_* instead).
+    return {
+        f"{prefix}pred_var_mean": pv,
+        f"{prefix}target_var_mean": tv,
+        f"{prefix}pred_target_var_ratio": min(pv / tv, 10.0) if tv > 1e-9 else 10.0,
+        f"{prefix}pred_norm_mean": pn,
+        f"{prefix}pred_target_norm_ratio": min(pn / tn, 10.0) if tn > 1e-9 else 10.0,
+    }
+
+
+@torch.no_grad()
+def collapse_stats(pred: torch.Tensor, target: torch.Tensor, emb: torch.Tensor) -> dict[str, float]:
+    """Encoder- + predictor-side collapse indicators for one one-step batch."""
+
+    e = _flat(emb)
+    ev = e.var(dim=0, unbiased=False)  # (D,)
+    return {
+        "enc_emb_var_mean": float(ev.mean()),
+        "enc_emb_std_mean": float(ev.clamp_min(0.0).sqrt().mean()),
+        "enc_emb_norm_mean": float(e.norm(dim=-1).mean()),
+        "enc_dead_dim_frac": float((ev < 1e-4).float().mean()),
+        **_predictor_collapse(pred, target),
+    }
+
+
+@torch.no_grad()
+def average_collapse(
+    model: torch.nn.Module, batches: list[dict[str, torch.Tensor]], history_size: int, num_preds: int
+) -> dict[str, float]:
+    acc: dict[str, list[float]] = {}
+    for batch in batches:
+        pred, target, emb = predict_target(model, batch_for_model(model, batch), history_size, num_preds)
+        for key, value in collapse_stats(pred, target, emb).items():
+            acc.setdefault(key, []).append(value)
+    return {f"col_{key}": float(np.mean(vals)) for key, vals in acc.items()}
 
 
 @torch.no_grad()
@@ -882,7 +946,9 @@ def average_rollout(model: torch.nn.Module, batches: list[dict[str, torch.Tensor
         stats = [rollout_stats(model, batch, history_size, horizon) for batch in batches]
         output[f"rollout_mse_{horizon}"] = float(np.mean([item["rollout_mse"] for item in stats]))
         if horizon == max(horizons):
-            for key in ("latent_norm_drift", "target_latent_norm", "pred_latent_variance"):
+            carry = ("latent_norm_drift", "target_latent_norm", "pred_latent_variance",
+                     "roll_pred_target_var_ratio", "roll_pred_target_norm_ratio")
+            for key in carry:
                 output[key] = float(np.mean([item[key] for item in stats]))
     return output
 
@@ -905,6 +971,7 @@ def evaluate(
     t1 = time.perf_counter()
     rollout = average_rollout(model, val_batches, profile.history_size, ROLLOUT_HORIZONS)
     rollout_eval_s = time.perf_counter() - t1
+    collapse = average_collapse(model, val_batches, profile.history_size, profile.num_preds)
     model.train()
     row: dict[str, Any] = {
         "optimizer": name,
@@ -916,6 +983,7 @@ def evaluate(
         "one_step_eval_time_s": float(one_step_eval_s),
         "rollout_eval_time_s": float(rollout_eval_s),
         **rollout,
+        **collapse,
     }
     if extra:
         row.update(extra)
@@ -935,6 +1003,38 @@ def mcsdca_extra(info: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Training loops (both driven by a shared backprop budget)                     #
 # --------------------------------------------------------------------------- #
+class EarlyStopper:
+    """MCSDCA-paper early stopping: halt when the validation loss has not improved
+    (by more than ``min_delta``) for ``patience`` consecutive periodic evals. With
+    ``eval_every_epochs = 1`` one eval == one epoch, matching the paper's
+    "4 consecutive epochs" rule."""
+
+    def __init__(self, enabled: bool, patience: int, min_delta: float) -> None:
+        self.enabled = bool(enabled)
+        self.patience = max(1, int(patience))
+        self.min_delta = max(0.0, float(min_delta))
+        self.best = float("inf")
+        self.bad = 0
+
+    @classmethod
+    def from_args(cls, args: Any) -> "EarlyStopper":
+        return cls(
+            getattr(args, "early_stop_enabled", False),
+            getattr(args, "early_stop_patience", 4),
+            getattr(args, "early_stop_min_delta", 0.0),
+        )
+
+    def should_stop(self, val_mse: float) -> bool:
+        if not self.enabled:
+            return False
+        if val_mse < self.best - self.min_delta:
+            self.best = val_mse
+            self.bad = 0
+        else:
+            self.bad += 1
+        return self.bad >= self.patience
+
+
 def train_baseline(
     name: str,
     model: torch.nn.Module,
@@ -951,6 +1051,7 @@ def train_baseline(
     optimizer = make_baseline_optimizer(name, params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = make_lewm_lr_scheduler(optimizer, budget)
     stream = make_stream(args.seed)
+    stopper = EarlyStopper.from_args(args)
     rows: list[dict[str, Any]] = []
     train_time_s = 0.0
     progress = tqdm(total=budget, desc=name, unit="bp", leave=False, dynamic_ncols=True)
@@ -966,13 +1067,19 @@ def train_baseline(
         train_time_s += time.perf_counter() - t0
         progress.update(1)
         progress.set_postfix(loss=f"{float(loss.detach()):.4g}", lr=f"{scheduler.get_last_lr()[0]:.2g}")
-        if step == 1 or step == budget or step % eval_interval == 0:
+        periodic = step % eval_interval == 0
+        if step == 1 or step == budget or periodic:
             row = evaluate(
                 name, model, train_batches, val_batches, profile, step, train_time_s,
                 {"learning_rate": scheduler.get_last_lr()[0], "status": "ok"},
             )
             rows.append(row)
             progress.set_postfix(train=f"{row['train_mse']:.4g}", val=f"{row['val_mse']:.4g}")
+            if periodic and step != budget and stopper.should_stop(float(row["val_mse"])):
+                row["early_stopped"] = True
+                tqdm.write(f"[{name}] early stop @ backprop {step} "
+                           f"(val_mse no improve for {stopper.patience} evals; best={stopper.best:.4g})")
+                break
     progress.close()
     return rows
 
@@ -1000,6 +1107,7 @@ def train_mcsdca(
         last_batch["value"] = batch
         return training_objective(model, batch, profile, sigreg, args.sigreg_weight)
 
+    stopper = EarlyStopper.from_args(args)
     rows: list[dict[str, Any]] = []
     train_time_s = 0.0
     next_eval_at = eval_interval
@@ -1016,14 +1124,21 @@ def train_mcsdca(
         bc = optimizer.backprop_calls
         progress.update(min(bc, budget) - progress.n)
         progress.set_postfix(outer=info["outer_step"], chain=info["markov_chain_length"], s_loss=f"{info['loss']:.4g}")
-        if optimizer.outer_step == 1 or bc >= budget or bc >= next_eval_at:
+        periodic = bc >= next_eval_at
+        if optimizer.outer_step == 1 or bc >= budget or periodic:
             row = evaluate(
                 name, model, train_batches, val_batches, profile, bc, train_time_s,
                 {**mcsdca_extra(info), "status": "ok"},
             )
             rows.append(row)
             progress.set_postfix(outer=info["outer_step"], s_loss=f"{info['loss']:.4g}", val=f"{row['val_mse']:.4g}")
-            next_eval_at = ((bc // eval_interval) + 1) * eval_interval
+            if periodic:
+                next_eval_at = ((bc // eval_interval) + 1) * eval_interval
+                if bc < budget and stopper.should_stop(float(row["val_mse"])):
+                    row["early_stopped"] = True
+                    tqdm.write(f"[{name}] early stop @ backprop {bc} "
+                               f"(val_mse no improve for {stopper.patience} evals; best={stopper.best:.4g})")
+                    break
     progress.close()
     return rows
 
@@ -1099,17 +1214,21 @@ def get_sampler(
     return sampler, key
 
 
-def get_model(model_config_path: Path, device: torch.device) -> "tuple[torch.nn.Module, dict[str, Any]]":
-    key = ("model", str(model_config_path), str(device))
-    return _memoize(_MODEL_MEMO, key, lambda: initialize_lewm(model_config_path, device), maxsize=1)
+def _model_key(model_cfg: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(model_cfg, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def get_base_state(model_config_path: Path, model_config: dict[str, Any], seed: int) -> dict[str, torch.Tensor]:
-    key = ("base_state", str(model_config_path), seed)
+def get_model(model_cfg: dict[str, Any], device: torch.device) -> "tuple[torch.nn.Module, dict[str, Any]]":
+    key = ("model", _model_key(model_cfg), str(device))
+    return _memoize(_MODEL_MEMO, key, lambda: initialize_lewm(model_cfg, device), maxsize=1)
+
+
+def get_base_state(model_cfg: dict[str, Any], seed: int) -> dict[str, torch.Tensor]:
+    key = ("base_state", _model_key(model_cfg), seed)
 
     def factory() -> dict[str, torch.Tensor]:
         seed_everything(seed)  # reproduce "seed then instantiate" so init stays seed-specific
-        tmp = instantiate(OmegaConf.create(model_config)).to("cpu")
+        tmp = instantiate(OmegaConf.create(model_cfg)).to("cpu")
         enable_full_model_training(tmp)
         state = clone_cpu_state(tmp)
         del tmp
@@ -1122,33 +1241,46 @@ def get_base_state(model_config_path: Path, model_config: dict[str, Any], seed: 
 # --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
-def run(args: argparse.Namespace) -> list[dict[str, Any]]:
+def run(args: SimpleNamespace, output_dir: Path) -> list[dict[str, Any]]:
+    """Train every optimizer in ``args.optimizers`` for one (data_fraction, seed).
+
+    Writes a fresh, uniquely named sub-folder under ``output_dir`` -- reruns never
+    overwrite. Returns the per-optimizer final metric rows.
+    """
+
     require_hdf5()
     data_path = Path(args.data_path).resolve()
-    model_config_path = Path(args.model_config).resolve()
-    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.output_dir).resolve() / run_id
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    run_id = f"{stamp}__seed{args.seed}"
+    run_dir = Path(output_dir).resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "config_yaml", None):
+        (run_dir / "config.yaml").write_text(args.config_yaml, encoding="utf-8")
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     tune_compute(device, getattr(args, "num_threads", 0))
     seed_everything(args.seed)
 
-    profile = resolve_profile(args)
+    profile = profile_from_args(args)
     training_seq_len = profile.history_size + profile.num_preds
     max_seq_len = profile.history_size + max(ROLLOUT_HORIZONS)
 
     sampler, sampler_key = get_sampler(
         data_path, profile.frameskip, max_seq_len, args.action_stats_samples, args.seed, profile.train_fraction
     )
-    model, model_config = get_model(model_config_path, device)
-    base_state = get_base_state(model_config_path, model_config, args.seed)
+    model, model_config = get_model(args.model, device)
+    base_state = get_base_state(args.model, args.seed)
 
     train_window_ids = sampler.select_window_ids("train", training_seq_len, profile.data_fraction, args.seed + 2)
     val_window_ids = sampler.select_window_ids("val", max_seq_len, profile.val_eval_fraction, args.seed + 7)
     steps_per_epoch = math.ceil(len(train_window_ids) / profile.batch_size)
-    budget = args.backprop_budget or profile.default_budget or steps_per_epoch * profile.epochs
-    eval_interval = args.eval_interval or max(1, math.ceil(budget / 10))
+    budget = profile.default_budget or steps_per_epoch * profile.epochs
+    if args.eval_interval:
+        eval_interval = args.eval_interval
+    elif getattr(args, "eval_every_epochs", None):
+        eval_interval = max(1, int(args.eval_every_epochs) * steps_per_epoch)
+    else:
+        eval_interval = max(1, math.ceil(budget * args.eval_interval_frac))
 
     # ---- resident training-window cache (plans 1-4): decode once, reuse ---- #
     memmap_dir = Path(args.memmap_dir).resolve() if args.memmap_dir else (data_path.parent / ".framecache")
@@ -1201,13 +1333,13 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         from stable_worldmodel.wm.loss import SIGReg
     except ImportError as exc:
         raise RuntimeError("Full LeWM training requires stable-worldmodel with SIGReg.") from exc
-    sigreg = SIGReg(knots=17, num_proj=profile.sigreg_num_proj).to(device)
+    sigreg = SIGReg(knots=args.sigreg_knots, num_proj=profile.sigreg_num_proj).to(device)
 
-    mcsdca_config = resolve_mcsdca_config(profile.mcsdca, args)
+    mcsdca_config = args.mcsdca_config
     optimizers = parse_optimizers(args.optimizers)
 
     print(
-        f"profile={args.training_profile} data_fraction={profile.data_fraction:.2%} "
+        f"data_fraction={profile.data_fraction:.2%} "
         f"train_windows={len(train_window_ids):,} budget={budget:,} "
         f"(~{budget / steps_per_epoch:.1f} epochs) eval_interval={eval_interval:,}"
     )
@@ -1222,13 +1354,14 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     final_results: list[dict[str, Any]] = []
 
     def payload() -> dict[str, Any]:
+        args_dump = {k: v for k, v in vars(args).items() if k not in ("model", "mcsdca_config", "config_yaml")}
         return {
-            "args": vars(args),
+            "args": args_dump,
             "device": str(device),
             "run_id": run_id,
             "dataset": sampler.describe(),
             "model_config": model_config,
-            "profile": {"name": args.training_profile, **asdict(profile)},
+            "profile": {"name": "yaml", **asdict(profile)},
             "mcsdca_config": asdict(mcsdca_config),
             "budget": int(budget),
             "steps_per_epoch": int(steps_per_epoch),
@@ -1282,78 +1415,49 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     return final_results
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="MCSDCA vs baselines as a full-model LeWM PushT optimizer.")
-    parser.add_argument("--data-path", default=str(ROOT / "data" / "pusht_expert_train.h5"))
-    parser.add_argument("--model-config", default=str(ROOT / "configs" / "lewm_pusht.json"))
-    parser.add_argument("--output-dir", default=str(ROOT / "outputs" / "pusht_predictor_optimizer"))
-    parser.add_argument("--run-id", default=None)
-    parser.add_argument("--optimizers", default=",".join(DEFAULT_OPTIMIZERS), help="Comma list or 'all'.")
-    parser.add_argument("--training-profile", choices=tuple(TRAINING_PROFILES), default="small")
-    parser.add_argument("--data-fraction", type=float, default=None, help="Override profile train-window fraction.")
-    parser.add_argument("--backprop-budget", type=int, default=None, help="Backward passes per optimizer (overrides profile).")
-    parser.add_argument("--eval-interval", type=int, default=None, help="Backprop calls between evaluations.")
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--sigreg-weight", type=float, default=0.09)
-    parser.add_argument("--precision", choices=("fp32", "bf16"), default=None, help="Override profile precision.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override profile batch size (biggest CPU-speed knob).")
-    parser.add_argument("--sigreg-num-proj", type=int, default=None, help="Override profile SIGReg projection count.")
-    parser.add_argument("--seed", type=int, default=3072)
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
-    parser.add_argument("--num-threads", type=int, default=0, help="Torch intra-op threads (0 = auto: min(16, ncpu)).")
-    parser.add_argument("--action-stats-samples", type=int, default=20000)
-    parser.add_argument(
-        "--window-cache", choices=("auto", "gpu", "cpu", "memmap", "off"), default="auto",
-        help="Decoded-window cache placement. auto: GPU if it fits, else CPU RAM, else on-disk "
-             "memmap (page-cached), else stream from HDF5. off = always stream.",
-    )
-    parser.add_argument("--cache-max-gb", type=float, default=6.0, help="GPU VRAM budget for the window cache.")
-    parser.add_argument("--cache-gpu-reserve-gb", type=float, default=14.0,
-                        help="VRAM to leave free for model+activations+MCSDCA chain (auto mode only).")
-    parser.add_argument("--cache-ram-gb", type=float, default=0.0,
-                        help="Host RAM budget for the window cache (0 = auto: 0.6x free RAM).")
-    parser.add_argument("--cache-disk-gb", type=float, default=3000.0, help="NVMe budget for the on-disk frame memmap.")
-    parser.add_argument(
-        "--memmap-dir", default=None,
-        help="Where the decoded-frame memmap files live (default: <data dir>/.framecache). "
-             "Reused across sweep points and reruns via a content hash.",
-    )
-    parser.add_argument(
-        "--prefetch-depth", type=int, default=3,
-        help="Minibatches read ahead on background threads (memmap/CPU tiers). 0 disables.",
-    )
-    parser.add_argument("--prefetch-workers", type=int, default=2, help="Background reader threads for prefetch.")
-    parser.add_argument(
-        "--cache-memo-size", type=int, default=2,
-        help="How many resident caches to keep across sweep points (odLD varies seed -> 2).",
-    )
-    parser.add_argument("--no-save-checkpoints", action="store_false", dest="save_checkpoints")
-    parser.set_defaults(save_checkpoints=True)
-    parser.add_argument("--mcsdca-epsilon", type=float, default=None)
-    parser.add_argument("--mcsdca-eta", type=float, default=None, help="Overdamped Langevin step size (od_eta).")
-    parser.add_argument("--mcsdca-delta", type=float, default=None, help="Underdamped Langevin step size (ud_delta).")
-    parser.add_argument("--mcsdca-beta0", type=float, default=None, help="Initial DCA mixing weight 1/(1+t*gamma_0).")
-    parser.add_argument("--mcsdca-langevin-steps", type=int, default=None)
-    parser.add_argument("--mcsdca-burn-in", type=int, default=None)
+DEFAULT_CONFIG = ROOT / "configs" / "experiment1.yaml"
+OUTPUT_ROOT = ROOT / "outputs"  # runs land in outputs/<dataTAG>/<stamp>__seed<seed>/
+
+
+def load_config(path: str | Path = DEFAULT_CONFIG, overrides: list[str] | None = None) -> Any:
+    """Load the single experiment YAML and apply ``key=value`` dotlist overrides."""
+
+    cfg = OmegaConf.load(str(path))
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
+    return cfg
+
+
+def data_tag(fraction: float) -> str:
+    """``0.04 -> data4``, ``0.001 -> data0p1`` (percent, '.' -> 'p')."""
+
+    return "data" + ("%g" % (fraction * 100.0)).replace(".", "p")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="LeWM PushT predictor optimizer: AdamW vs MCSDCA (single-YAML, no tuning).")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to the experiment YAML.")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        metavar="KEY=VALUE", help="Dotlist override, repeatable (e.g. --set train.budget=400).")
+    parser.add_argument("--device", default=None, help="Override cfg.device (auto, cpu, cuda, cuda:N).")
+    parser.add_argument("--dry-run", action="store_true", help="Print the resolved plan and exit.")
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    if args.data_fraction is not None and not 0.0 < args.data_fraction <= 1.0:
-        raise ValueError("--data-fraction must be in (0, 1].")
-    if args.backprop_budget is not None and args.backprop_budget <= 0:
-        raise ValueError("--backprop-budget must be positive.")
-    if args.eval_interval is not None and args.eval_interval <= 0:
-        raise ValueError("--eval-interval must be positive.")
-    if args.sigreg_weight < 0:
-        raise ValueError("--sigreg-weight must be non-negative.")
-    if args.batch_size is not None and args.batch_size <= 0:
-        raise ValueError("--batch-size must be positive.")
-    if args.sigreg_num_proj is not None and args.sigreg_num_proj <= 0:
-        raise ValueError("--sigreg-num-proj must be positive.")
-    run(args)
+    args = build_arg_parser().parse_args()
+    cfg = load_config(args.config, args.overrides)
+    if args.device:
+        cfg.device = args.device
+    fraction = float(cfg.data.fractions[0])
+    seed = int(cfg.seed[0])
+    out_dir = OUTPUT_ROOT / data_tag(fraction)
+    run_args = build_run_args(cfg, data_fraction=fraction, seed=seed)
+    print(f"[engine] one run: {data_tag(fraction)} seed={seed} optimizers={list(cfg.optimizers)}")
+    if args.dry_run:
+        print(OmegaConf.to_yaml(cfg))
+        return
+    run(run_args, out_dir)
 
 
 if __name__ == "__main__":

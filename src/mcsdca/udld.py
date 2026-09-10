@@ -9,7 +9,6 @@ from torch import nn
 from .config import MCSDCAConfig
 from .param_utils import (
     assign_params,
-    clip_grads,
     clone_params,
     clone_tensors,
     dca_closed_form_update,
@@ -80,7 +79,6 @@ class MCSDCAUdLD:
             loss.backward()
 
             grads = [param.grad.detach().clone() for param in self.params]
-            grads = clip_grads(grads, cfg.max_grad_norm)
             loss_sum += float(loss.detach().cpu())
             transition_count += 1
             self.backprop_calls += 1
