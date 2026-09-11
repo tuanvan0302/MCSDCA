@@ -1241,11 +1241,13 @@ def get_base_state(model_cfg: dict[str, Any], seed: int) -> dict[str, torch.Tens
 # --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
-def run(args: SimpleNamespace, output_dir: Path) -> list[dict[str, Any]]:
+def run(args: SimpleNamespace, output_dir: Path) -> tuple[Path, list[dict[str, Any]]]:
     """Train every optimizer in ``args.optimizers`` for one (data_fraction, seed).
 
     Writes a fresh, uniquely named sub-folder under ``output_dir`` -- reruns never
-    overwrite. Returns the per-optimizer final metric rows.
+    overwrite. Returns ``(run_dir, per_optimizer_final_rows)``; everything for this
+    run (metrics.csv, run.json, config.yaml, and the driver's comparison*.csv)
+    lives inside ``run_dir``.
     """
 
     require_hdf5()
@@ -1412,7 +1414,7 @@ def run(args: SimpleNamespace, output_dir: Path) -> list[dict[str, Any]]:
             tqdm.write(f"[{name}] diverged: {final.get('error')}")
 
     tqdm.write(f"wrote {run_dir}")
-    return final_results
+    return run_dir, final_results
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "experiment1.yaml"
@@ -1457,7 +1459,8 @@ def main() -> None:
     if args.dry_run:
         print(OmegaConf.to_yaml(cfg))
         return
-    run(run_args, out_dir)
+    run_dir, _ = run(run_args, out_dir)
+    print(f"[engine] -> {run_dir}")
 
 
 if __name__ == "__main__":

@@ -79,15 +79,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def write_comparison(fraction: float, rows: list[dict[str, Any]], out_dir: Path) -> None:
-    """rows: one dict per (optimizer, seed) final result for this fraction."""
-
-    fieldnames = ["optimizer", "seed", "data_fraction", *METRIC_KEYS, "error"]
-    with (out_dir / "comparison.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-
+def _aggregate(fraction: float, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     names = list(dict.fromkeys(r["optimizer"] for r in rows))
     agg: list[dict[str, Any]] = []
     for name in names:
@@ -98,12 +90,28 @@ def write_comparison(fraction: float, rows: list[dict[str, Any]], out_dir: Path)
             entry[f"{metric}_mean"] = statistics.fmean(vals) if vals else None
             entry[f"{metric}_std"] = statistics.pstdev(vals) if len(vals) > 1 else 0.0
         agg.append(entry)
+    return agg
+
+
+def write_comparison(fraction: float, rows: list[dict[str, Any]], run_dirs: list[Path]) -> None:
+    """Write comparison.csv / comparison_agg.csv INTO every run folder from this
+    invocation (self-contained; a later run never overwrites an earlier one).
+    ``rows``: one dict per (optimizer, seed) final result."""
+
+    fieldnames = ["optimizer", "seed", "data_fraction", *METRIC_KEYS, "error"]
+    agg = _aggregate(fraction, rows)
     agg_fields = ["optimizer", "data_fraction", "n_seeds_ok",
                   *[f"{m}_{s}" for m in AGG_METRICS for s in ("mean", "std")]]
-    with (out_dir / "comparison_agg.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=agg_fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(agg)
+
+    for rd in run_dirs:
+        with (rd / "comparison.csv").open("w", newline="", encoding="utf-8") as handle:
+            w = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        with (rd / "comparison_agg.csv").open("w", newline="", encoding="utf-8") as handle:
+            w = csv.DictWriter(handle, fieldnames=agg_fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(agg)
 
     print(f"\n=== {data_tag(fraction)}  (mean over seeds) ===")
     print(f"{'optimizer':<14} {'n_ok':>4} {'val_mse':>11} {'rollout5':>11} {'pred/tgt var':>13} {'enc var':>10}")
@@ -113,7 +121,8 @@ def write_comparison(fraction: float, rows: list[dict[str, Any]], out_dir: Path)
             return f"{v:.5f}" if isinstance(v, float) else "n/a"
         print(f"{entry['optimizer']:<14} {entry['n_seeds_ok']:>4} {fmt('val_mse_mean'):>11} {fmt('rollout_mse_5_mean'):>11} "
               f"{fmt('col_pred_target_var_ratio_mean'):>13} {fmt('col_enc_emb_var_mean_mean'):>10}")
-    print(f"wrote {out_dir/'comparison.csv'}  {out_dir/'comparison_agg.csv'}")
+    for rd in run_dirs:
+        print(f"wrote {rd/'comparison.csv'}")
 
 
 def main() -> None:
@@ -142,16 +151,18 @@ def main() -> None:
         out_dir = OUT_ROOT / data_tag(fraction)
         out_dir.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
+        run_dirs: list[Path] = []
         for seed in seeds:
             print(f"\n---- {data_tag(fraction)}  seed {seed} ----")
             run_args = build_run_args(cfg, data_fraction=fraction, seed=seed)
-            finals = run(run_args, out_dir)
+            run_dir, finals = run(run_args, out_dir)
+            run_dirs.append(run_dir)
             for final in finals:
                 rows.append({
                     "optimizer": final.get("optimizer"), "seed": seed, "data_fraction": fraction,
                     **{k: final.get(k) for k in METRIC_KEYS}, "error": final.get("error", ""),
                 })
-        write_comparison(fraction, rows, out_dir)
+        write_comparison(fraction, rows, run_dirs)
 
     print(f"\n[experiment1] done -> {OUT_ROOT}")
 
