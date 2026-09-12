@@ -107,7 +107,7 @@ eval:
   val_batches: 16
 
 cache:                       # decoded-window cache (data-loading only; no effect on results)
-  mode: auto                 # auto | gpu | cpu | memmap | off
+  mode: auto                 # auto | gpu | cpu | memmap | png | off
   max_gb: 6.0
   gpu_reserve_gb: 14.0
   ram_gb: 0.0                # 0 => auto (0.6x free RAM)
@@ -116,6 +116,8 @@ cache:                       # decoded-window cache (data-loading only; no effec
   prefetch_depth: 3
   prefetch_workers: 2
   memo_size: 2
+  png_compress_level: 6      # PNG cache tier (auto-picked when raw memmap doesn't fit disk;
+  png_build_workers: 0       # lossless, ~13x smaller than raw); 0 build workers => os.cpu_count()
 
 device: auto                 # auto | cpu | cuda | cuda:N
 num_threads: 0               # torch intra-op threads (0 => auto)

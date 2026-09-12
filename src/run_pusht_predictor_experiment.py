@@ -21,6 +21,7 @@ import argparse
 import csv
 import gc
 import hashlib
+import io
 import json
 import math
 import os
@@ -68,6 +69,10 @@ ROLLOUT_HORIZONS = (1, 3, 5)
 BASELINE_OPTIMIZERS = ("AdamW", "Adam")
 MCSDCA_OPTIMIZERS = ("MCSDCA-odLD", "MCSDCA-udLD")
 DEFAULT_OPTIMIZERS = ("AdamW", "MCSDCA-odLD", "MCSDCA-udLD")
+# Measured on real PushT frames (150,528 raw bytes/frame vs ~11,532 PNG bytes/frame at
+# compress_level=6): used only for capacity planning in resolve_cache_placement -- the
+# actual ratio realized during a build is printed precisely by PushTHDF5Sampler._build_png_blob.
+PNG_COMPRESSION_RATIO_ESTIMATE = 13.0
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +198,8 @@ def build_run_args(cfg: Any, *, data_fraction: float, seed: int) -> SimpleNamesp
         prefetch_depth=int(c.prefetch_depth),
         prefetch_workers=int(c.prefetch_workers),
         cache_memo_size=int(c.memo_size),
+        png_compress_level=int(c.png_compress_level),
+        png_build_workers=int(c.png_build_workers),
         # io
         save_checkpoints=bool(cfg.save_checkpoints),
     )
@@ -210,6 +217,16 @@ def require_hdf5() -> Any:
             "PushT HDF5 pixels use Blosc compression. Install: uv pip install hdf5plugin h5py"
         ) from exc
     return h5py
+
+
+def require_pillow() -> Any:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "The PNG-blob window cache (cache.mode=png) needs Pillow. Install: uv pip install pillow"
+        ) from exc
+    return Image
 
 
 def optimizer_key(name: str) -> str:
@@ -437,18 +454,27 @@ class PushTHDF5Sampler:
         windows = self._resolve_windows(split, seq_len, window_ids)
         return int(np.unique(self._window_frame_ids(windows, seq_len)).size)
 
+    @staticmethod
+    def _contiguous_runs(uniq: np.ndarray):
+        """Yield ``(lo_pos, hi_pos, first_frame_id)`` for each maximal run of
+        consecutive frame ids in the SORTED unique array ``uniq`` -- shared by
+        every cache builder that wants big slab reads instead of one read per
+        frame (raw memmap and PNG-blob alike)."""
+
+        boundaries = np.flatnonzero(np.diff(uniq) != 1)
+        run_edges = np.concatenate(([0], boundaries + 1, [uniq.size]))
+        for lo_pos, hi_pos in zip(run_edges[:-1], run_edges[1:], strict=True):
+            yield int(lo_pos), int(hi_pos), int(uniq[lo_pos])  # run is contiguous: uniq[lo:hi] == first+arange(...)
+
     def _fill_frames(self, dst: Any, uniq: np.ndarray, read_chunk: int) -> None:
         """Read the unique frames ``uniq`` (sorted) from HDF5 in contiguous runs
         into ``dst`` (a ``[F, C, H, W]`` torch tensor slice-assignable, or an
         ``np.memmap``). One big slab read per run, permuted H,W,C -> C,H,W."""
 
         is_tensor = isinstance(dst, torch.Tensor)
-        boundaries = np.flatnonzero(np.diff(uniq) != 1)
-        run_edges = np.concatenate(([0], boundaries + 1, [uniq.size]))
-        for lo_pos, hi_pos in zip(run_edges[:-1], run_edges[1:], strict=True):
-            first = int(uniq[lo_pos])  # run is fully contiguous: uniq[lo_pos:hi_pos] == first + arange(...)
-            for sub in range(int(lo_pos), int(hi_pos), read_chunk):
-                sub_hi = min(sub + read_chunk, int(hi_pos))
+        for lo_pos, hi_pos, first in self._contiguous_runs(uniq):
+            for sub in range(lo_pos, hi_pos, read_chunk):
+                sub_hi = min(sub + read_chunk, hi_pos)
                 slab = self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
                 chw = np.ascontiguousarray(np.moveaxis(slab, 3, 1))  # [n, C, H, W]
                 dst[sub:sub_hi] = torch.from_numpy(chw) if is_tensor else chw
@@ -546,6 +572,115 @@ class PushTHDF5Sampler:
             disk_path=dat,
         )
 
+    def _build_png_blob(
+        self, uniq: np.ndarray, blob_path: Path, compress_level: int, workers: int, read_chunk: int,
+    ) -> np.ndarray:
+        """Encode every frame in ``uniq`` to a lossless PNG and append it to one
+        blob file; returns the ``[F, 2]`` int64 ``(offset, length)`` index.
+
+        Reads big contiguous slabs from HDF5 (via ``_contiguous_runs``, same as
+        the raw memmap builder) and PNG-encodes each frame in a thread pool --
+        Pillow's encoder releases the GIL, so this scales with real cores
+        (measured ~6x at 16 threads on an 8-core box)."""
+
+        Image = require_pillow()
+        n = int(uniq.size)
+        index = np.empty((n, 2), dtype=np.int64)
+
+        def encode_one(hwc: np.ndarray) -> bytes:
+            buf = io.BytesIO()
+            Image.fromarray(hwc).save(buf, format="PNG", compress_level=compress_level)
+            return buf.getvalue()
+
+        print(f"[png-cache] building {blob_path.name}  ({n:,} unique frames, {workers} workers, "
+              f"compress_level={compress_level})...")
+        t_start = time.perf_counter()
+        offset = 0
+        pos = 0
+        with open(blob_path, "wb") as out, ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            progress = tqdm(total=n, desc="png-cache", unit="frame", dynamic_ncols=True)
+            for lo_pos, hi_pos, first in self._contiguous_runs(uniq):
+                for sub in range(lo_pos, hi_pos, read_chunk):
+                    sub_hi = min(sub + read_chunk, hi_pos)
+                    slab = np.asarray(self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)])
+                    for blob in pool.map(encode_one, slab):  # pool.map preserves input order
+                        index[pos] = (offset, len(blob))
+                        out.write(blob)
+                        offset += len(blob)
+                        pos += 1
+                    elapsed = time.perf_counter() - t_start
+                    progress.set_postfix(fps=f"{pos / elapsed:,.0f}" if elapsed > 0 else "0")
+                    progress.update(sub_hi - sub)
+            progress.close()
+
+        elapsed = time.perf_counter() - t_start
+        size_gb = offset / 1e9
+        _, height, width, channels = self.pixel_shape
+        raw_gb = n * height * width * channels / 1e9
+        ratio = raw_gb / size_gb if size_gb > 0 else 0.0
+        print(f"[png-cache] done: {n:,} frames, {size_gb:.2f} GB (raw would be ~{raw_gb:.1f} GB, "
+              f"{ratio:.1f}x smaller), {elapsed:.1f}s ({n / elapsed:,.0f} fps)")
+        return index
+
+    def materialize_windows_png(
+        self,
+        split: str,
+        seq_len: int,
+        window_ids: np.ndarray,
+        cache_dir: Path,
+        compute_device: torch.device,
+        compress_level: int = 6,
+        build_workers: int = 0,
+        read_chunk: int = 2048,
+    ) -> "WindowCache":
+        """Like ``materialize_windows_memmap`` but each unique frame is stored as
+        an independently-seekable, lossless PNG blob (~13x smaller on disk than
+        raw uint8) instead of a fixed-stride memmap. Built once and reused across
+        reruns via the same content-hash scheme; see ``_build_png_blob``."""
+
+        require_pillow()
+        windows = self._resolve_windows(split, seq_len, window_ids)
+        frame_ids = self._window_frame_ids(windows, seq_len)
+        uniq = np.unique(frame_ids)
+        _, height, width, channels = self.pixel_shape
+        n_unique = int(uniq.size)
+
+        tag = hashlib.sha1(
+            repr((str(self.path), self._mtime, split, seq_len, (n_unique, channels, height, width),
+                  int(uniq[0]), int(uniq[-1]), int(len(window_ids)))).encode()
+        ).hexdigest()[:16]
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        blob_path = Path(cache_dir) / f"frames_{split}_{tag}.png.blob"
+        idx_path = blob_path.with_suffix(".idx.npy")
+        meta_path = blob_path.with_suffix(".json")
+        want = {"count": n_unique, "compress_level": int(compress_level)}
+        ready = (
+            blob_path.exists() and idx_path.exists() and meta_path.exists()
+            and json.loads(meta_path.read_text(encoding="utf-8")) == want
+        )
+
+        if ready:
+            print(f"[png-cache] found cached blob, reuse (skip build): {blob_path.name}")
+            png_index = np.load(idx_path)
+        else:
+            workers = build_workers if build_workers and build_workers > 0 else max(1, os.cpu_count() or 4)
+            png_index = self._build_png_blob(uniq, blob_path, compress_level, workers, read_chunk)
+            np.save(idx_path, png_index)
+            meta_path.write_text(json.dumps(want), encoding="utf-8")
+
+        local_rows = np.searchsorted(uniq, frame_ids).astype(np.int64)
+        return WindowCache(
+            window_frame_rows=torch.from_numpy(local_rows),
+            window_actions=self._window_actions(windows, seq_len),  # kept on CPU; moved per-batch
+            seq_len=seq_len,
+            compute_device=compute_device,
+            backing="png",
+            disk_path=blob_path,
+            png_blob_path=blob_path,
+            png_index=png_index,
+            png_frame_shape=(channels, height, width),
+        )
+
     def describe(self) -> dict[str, Any]:
         return {
             "path": str(self.path),
@@ -571,39 +706,74 @@ class WindowCache:
     ``window_frame_rows[i]`` gathers window ``i``'s ``seq_len`` frames out of it.
     ``take()`` produces a model-ready, float-normalized batch on
     ``compute_device`` with zero disk access.
+
+    ``backing == "png"`` is the exception: there is no ``frames_u8`` tensor --
+    frames live as independently-seekable PNG blobs (``png_blob_path`` +
+    ``png_index``, see ``PushTHDF5Sampler.materialize_windows_png``), and
+    ``png_frame_shape`` stands in for ``frames_u8.shape[1:]``. This tier always
+    goes through ``gather_cpu`` + ``finalize`` (never ``take()``), same as memmap.
     """
 
-    frames_u8: torch.Tensor          # [F, C, H, W] uint8 (GPU / CPU RAM / memmap-backed)
-    window_frame_rows: torch.Tensor  # [N, seq_len] int64, indices into frames_u8
+    window_frame_rows: torch.Tensor  # [N, seq_len] int64, indices into frames_u8 / png_index
     window_actions: torch.Tensor     # [N, seq_len, frameskip*A] float32
     seq_len: int
     compute_device: torch.device
-    backing: str = "memory"          # "cuda" | "cpu" | "memmap"
+    frames_u8: torch.Tensor | None = None  # [F, C, H, W] uint8; unused when backing == "png"
+    backing: str = "memory"          # "cuda" | "cpu" | "memmap" | "png"
     disk_path: Path | None = None
+    png_blob_path: Path | None = None       # concatenated PNG bytes, one run per unique frame
+    png_index: np.ndarray | None = None     # [F, 2] int64 (offset, length) into png_blob_path
+    png_frame_shape: tuple[int, int, int] | None = None  # (C, H, W), since there is no frames_u8
 
     def __post_init__(self) -> None:
         self._mean = IMAGE_MEAN.to(self.compute_device, dtype=torch.float32)
         self._std = IMAGE_STD.to(self.compute_device, dtype=torch.float32)
-        self._frame_shape = tuple(self.frames_u8.shape[1:])  # (C, H, W)
+        self._frame_shape = tuple(self.frames_u8.shape[1:]) if self.frames_u8 is not None else self.png_frame_shape
 
     def __len__(self) -> int:
         return self.window_frame_rows.shape[0]
 
     def nbytes(self) -> int:
+        if self.frames_u8 is not None:
+            frames_bytes = self.frames_u8.element_size() * self.frames_u8.nelement()
+        elif self.png_blob_path is not None and self.png_blob_path.exists():
+            frames_bytes = self.png_blob_path.stat().st_size  # actual compressed size on disk
+        else:
+            frames_bytes = 0
         return (
-            self.frames_u8.element_size() * self.frames_u8.nelement()
+            frames_bytes
             + self.window_frame_rows.element_size() * self.window_frame_rows.nelement()
             + self.window_actions.element_size() * self.window_actions.nelement()
         )
 
+    def _gather_png(self, rows: torch.Tensor) -> torch.Tensor:
+        """Seek + decode PNG bytes for the requested unique-frame rows. Opens
+        its own file handle per call so concurrent prefetch threads (each
+        running its own ``gather_cpu``) never share a seek position."""
+
+        Image = require_pillow()
+        rows_np = rows.numpy()
+        c, h, w = self._frame_shape
+        out = np.empty((rows_np.shape[0], h, w, c), dtype=np.uint8)
+        with open(self.png_blob_path, "rb") as fh:
+            for i, r in enumerate(rows_np):
+                offset, length = self.png_index[r]
+                fh.seek(int(offset))
+                out[i] = np.asarray(Image.open(io.BytesIO(fh.read(int(length)))).convert("RGB"))
+        chw = np.ascontiguousarray(np.moveaxis(out, 3, 1))  # [n, H, W, C] -> [n, C, H, W]
+        return torch.from_numpy(chw)
+
     def gather_cpu(self, idx: torch.Tensor) -> dict[str, torch.Tensor]:
         """CPU-only, thread-safe: gather raw ``uint8`` pixels + actions for a
-        batch (this is the page-faulting / NVMe read for the memmap backend).
+        batch (page-faulting / NVMe read for memmap; seek+PNG-decode for png).
         Pins the result when possible so the follow-up H2D copy can overlap."""
 
         idx = idx.to("cpu", dtype=torch.long)
         rows = self.window_frame_rows.index_select(0, idx).reshape(-1)
-        pixels_u8 = self.frames_u8.index_select(0, rows)          # [batch*seq_len, C, H, W] uint8
+        if self.backing == "png":
+            pixels_u8 = self._gather_png(rows)
+        else:
+            pixels_u8 = self.frames_u8.index_select(0, rows)      # [batch*seq_len, C, H, W] uint8
         action = self.window_actions.index_select(0, idx)
         try:
             pixels_u8 = pixels_u8.pin_memory()
@@ -712,8 +882,15 @@ def resolve_cache_placement(
     """Decide where the resident training cache lives.
 
     Returns ``(use_cache, frames_device, backing, reason)`` where ``backing`` is
-    ``"cuda"`` (GPU), ``"cpu"`` (host RAM), ``"memmap"`` (on-disk NVMe, page
-    cached) or ``"none"`` (fall back to the per-batch HDF5 stream).
+    ``"cuda"`` (GPU), ``"cpu"`` (host RAM), ``"memmap"`` (on-disk NVMe, raw
+    uint8, page cached), ``"png"`` (on-disk, lossless PNG blob, ~13x smaller
+    than raw -- for when even the raw memmap doesn't fit the disk budget) or
+    ``"none"`` (fall back to the per-batch HDF5 stream).
+
+    ``auto`` tries, in order: GPU -> host RAM -> disk memmap (raw) -> disk PNG
+    (compressed) -> streaming. PNG is strictly a fallback for when raw memmap
+    doesn't fit -- decoding it costs a bit of CPU per batch, so memmap is
+    preferred whenever both fit.
 
     A GPU-resident cache competes with the model + activations + (for MCSDCA)
     the retained-sample chain, so it is only chosen when ``est_gb`` fits under
@@ -770,8 +947,8 @@ def resolve_cache_placement(
                 f"try cache.mode=memmap or a smaller data.fractions)"
             )
 
-    if mode in ("auto", "memmap"):
-        free_disk_gb = float("inf")
+    free_disk_gb = float("inf")
+    if mode in ("auto", "memmap", "png"):
         try:
             free_disk_gb = shutil.disk_usage(str(memmap_dir)).free / 1e9
         except Exception:  # noqa: BLE001 - directory may not exist yet
@@ -780,13 +957,34 @@ def resolve_cache_placement(
             except Exception:  # noqa: BLE001
                 pass
         disk_cap = min(disk_budget_gb, 0.9 * free_disk_gb)
+
+    if mode in ("auto", "memmap"):
         if est_gb <= disk_cap:
             return True, cpu, "memmap", (
                 f"disk memmap (~{est_gb:.1f} GB in {memmap_dir}, page-cached; "
                 f"{free_disk_gb:.0f} GB free)"
             )
+        if mode == "memmap":
+            return False, cpu, "none", (
+                f"forced disk memmap too big (~{est_gb:.1f} GB > {disk_cap:.1f} GB); "
+                f"try cache.mode=png or raise cache.disk_gb"
+            )
+        # mode == "auto": raw memmap doesn't fit -- fall through and try the
+        # compressed PNG blob before giving up to unprefetched streaming.
+
+    if mode in ("auto", "png"):
+        est_png_gb = est_gb / PNG_COMPRESSION_RATIO_ESTIMATE
+        if est_png_gb <= disk_cap:
+            return True, cpu, "png", (
+                f"disk PNG cache (~{est_png_gb:.1f} GB compressed, lossless, from ~{est_gb:.1f} GB raw, "
+                f"in {memmap_dir}; {free_disk_gb:.0f} GB free)"
+            )
+        if mode == "png":
+            return False, cpu, "none", (
+                f"forced PNG cache too big (~{est_png_gb:.1f} GB > {disk_cap:.1f} GB); raise cache.disk_gb"
+            )
         return False, cpu, "none", (
-            f"streaming fallback (~{est_gb:.1f} GB > RAM and disk caps; "
+            f"streaming fallback (~{est_gb:.1f} GB raw / ~{est_png_gb:.1f} GB PNG > {disk_cap:.1f} GB disk cap; "
             f"raise cache.ram_gb / cache.disk_gb or use a smaller data.fractions)"
         )
 
@@ -1313,6 +1511,12 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[dict[str, Path], list[
             builder: Callable[[], WindowCache] = lambda: sampler.materialize_windows_memmap(
                 "train", training_seq_len, train_window_ids, memmap_dir, device
             )
+        elif backing == "png":
+            builder = lambda: sampler.materialize_windows_png(
+                "train", training_seq_len, train_window_ids, memmap_dir, device,
+                compress_level=getattr(args, "png_compress_level", 6),
+                build_workers=getattr(args, "png_build_workers", 0),
+            )
         else:
             builder = lambda: sampler.materialize_windows(
                 "train", training_seq_len, train_window_ids, frames_device, device
@@ -1356,7 +1560,7 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[dict[str, Path], list[
         f"(~{budget / steps_per_epoch:.1f} epochs) eval_interval={eval_interval:,}"
     )
     if use_cache:
-        where = "on disk" if backing == "memmap" else "resident"
+        where = "on disk" if backing in ("memmap", "png") else "resident"
         print(f"  window-cache: {cache_reason}  [{cache_bytes / 1e9:.1f} GB {where}, "
               f"{est_frames:,} unique frames, prefetch={prefetch}]")
     else:
