@@ -390,16 +390,24 @@ class PushTHDF5Sampler:
     @property
     def pixels_ds(self) -> Any:
         """The raw HDF5 pixel dataset -- only needed for streaming, or to build
-        a cache tier that isn't already on disk. Raises a clear error instead of
-        a confusing ``NoneType`` crash when the source file was deleted after
-        every pixel cache was already built."""
+        a cache tier that isn't already on disk. Lazily opens ``self.path`` on
+        first use, independent of whether metadata came from the sidecar or a
+        live HDF5 read: metadata may have been loaded from ``dataset_meta.npz``
+        while the source file was missing, then the file gets restored later
+        (e.g. just to build one new cache selection) -- that must work without
+        re-running the sampler. Raises a clear error instead of a confusing
+        ``NoneType`` crash when the source is still missing at the point pixels
+        are actually needed."""
 
         if self._pixels_ds is None:
-            raise RuntimeError(
-                f"Need the original HDF5 pixels ({self.path}) for this operation (no existing "
-                "PNG/memmap cache covers it), but the source file is missing and only the "
-                "metadata sidecar was found. Restore the --data file to build this selection."
-            )
+            if not Path(self.path).exists():
+                raise RuntimeError(
+                    f"Need the original HDF5 pixels ({self.path}) for this operation (no existing "
+                    "PNG/memmap cache covers it), but the source file is missing and only the "
+                    "metadata sidecar was found. Restore the --data file to build this selection."
+                )
+            self._h5 = self.h5py.File(self.path, "r", rdcc_nbytes=256 * 1024 * 1024)
+            self._pixels_ds = self._h5["pixels"]
         return self._pixels_ds
 
     def _episode_pool(self, split: str) -> np.ndarray:
