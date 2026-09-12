@@ -150,6 +150,7 @@ def build_run_args(cfg: Any, *, data_fraction: float, seed: int) -> SimpleNamesp
         model=OmegaConf.to_container(cfg.model, resolve=True),
         data_fraction=float(data_fraction),
         seed=int(seed),
+        run_tag=str(getattr(cfg, "run_tag", "") or ""),
         device=device,
         num_threads=int(cfg.num_threads),
         action_stats_samples=int(cfg.data.action_stats_samples),
@@ -1146,8 +1147,8 @@ def train_mcsdca(
 # --------------------------------------------------------------------------- #
 # Result IO                                                                    #
 # --------------------------------------------------------------------------- #
-def save_checkpoint(run_dir: Path, name: str, model: torch.nn.Module) -> Path:
-    path = run_dir / "checkpoints" / f"{optimizer_key(name)}_full_model.pt"
+def save_checkpoint(run_dir: Path, model: torch.nn.Module) -> Path:
+    path = run_dir / "checkpoints" / "full_model.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({key: value.detach().cpu() for key, value in model.state_dict().items()}, path)
     return path
@@ -1241,23 +1242,32 @@ def get_base_state(model_cfg: dict[str, Any], seed: int) -> dict[str, torch.Tens
 # --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
-def run(args: SimpleNamespace, output_dir: Path) -> tuple[Path, list[dict[str, Any]]]:
+def run(args: SimpleNamespace, output_dir: Path) -> tuple[dict[str, Path], list[dict[str, Any]]]:
     """Train every optimizer in ``args.optimizers`` for one (data_fraction, seed).
 
-    Writes a fresh, uniquely named sub-folder under ``output_dir`` -- reruns never
-    overwrite. Returns ``(run_dir, per_optimizer_final_rows)``; everything for this
-    run (metrics.csv, run.json, config.yaml, and the driver's comparison*.csv)
-    lives inside ``run_dir``.
+    Each optimizer writes into its own leaf folder so re-running a single
+    algorithm (e.g. after tweaking its hyperparameters, same seed) never touches
+    the others' results:
+
+        output_dir/<optimizer_key>/<run_id>/
+            config.yaml  metrics.csv  run.json
+            checkpoints/full_model.pt   (when ``args.save_checkpoints``)
+
+    ``run_id`` is ``<stamp>__seed<seed>``, plus ``__<run_tag>`` when
+    ``args.run_tag`` is set -- a human-readable label to tell repeated runs at
+    the same seed apart without opening ``run.json``. A fresh timestamp every
+    call means reruns never overwrite an earlier one.
+
+    Returns ``(run_dirs, per_optimizer_final_rows)`` where ``run_dirs`` maps
+    optimizer name -> its leaf folder.
     """
 
     require_hdf5()
     data_path = Path(args.data_path).resolve()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    run_id = f"{stamp}__seed{args.seed}"
-    run_dir = Path(output_dir).resolve() / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if getattr(args, "config_yaml", None):
-        (run_dir / "config.yaml").write_text(args.config_yaml, encoding="utf-8")
+    run_tag = str(getattr(args, "run_tag", "") or "").strip()
+    run_id = f"{stamp}__seed{args.seed}" + (f"__{run_tag}" if run_tag else "")
+    output_dir = Path(output_dir).resolve()
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     tune_compute(device, getattr(args, "num_threads", 0))
@@ -1352,15 +1362,13 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[Path, list[dict[str, A
     else:
         print(f"  window-cache: {cache_reason}")
 
-    all_rows: list[dict[str, Any]] = []
-    final_results: list[dict[str, Any]] = []
-
-    def payload() -> dict[str, Any]:
+    def payload(name: str, final: dict[str, Any]) -> dict[str, Any]:
         args_dump = {k: v for k, v in vars(args).items() if k not in ("model", "mcsdca_config", "config_yaml")}
         return {
             "args": args_dump,
             "device": str(device),
             "run_id": run_id,
+            "optimizer": name,
             "dataset": sampler.describe(),
             "model_config": model_config,
             "profile": {"name": "yaml", **asdict(profile)},
@@ -1379,10 +1387,18 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[Path, list[dict[str, A
                 "bytes": int(cache_bytes),
                 "prefetch": int(prefetch),
             },
-            "final_results": final_results,
+            "final_result": final,
         }
 
+    run_dirs: dict[str, Path] = {}
+    final_results: list[dict[str, Any]] = []
+
     for name in optimizers:
+        opt_dir = output_dir / optimizer_key(name) / run_id
+        opt_dir.mkdir(parents=True, exist_ok=True)
+        if getattr(args, "config_yaml", None):
+            (opt_dir / "config.yaml").write_text(args.config_yaml, encoding="utf-8")
+
         tqdm.write(f"[{name}] training")
         seed_everything(args.seed)
         restore_state(model, base_state, device)
@@ -1402,23 +1418,22 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[Path, list[dict[str, A
             traceback.print_exc()
             final = {"optimizer": name, "status": "diverged", "error": repr(exc)}
             rows = [final]
-        all_rows.extend(rows)
         final_results.append(final)
         if args.save_checkpoints and final.get("status") == "ok":
-            save_checkpoint(run_dir, name, model)
-        write_metrics(run_dir, all_rows)
-        write_run_json(run_dir, payload())
+            save_checkpoint(opt_dir, model)
+        write_metrics(opt_dir, rows)
+        write_run_json(opt_dir, payload(name, final))
+        run_dirs[name] = opt_dir
         if final.get("status") == "ok":
-            tqdm.write(f"[{name}] ok val_mse={final['val_mse']:.6g} backprop_calls={final['backprop_calls']}")
+            tqdm.write(f"[{name}] ok val_mse={final['val_mse']:.6g} backprop_calls={final['backprop_calls']}  -> {opt_dir}")
         else:
-            tqdm.write(f"[{name}] diverged: {final.get('error')}")
+            tqdm.write(f"[{name}] diverged: {final.get('error')}  -> {opt_dir}")
 
-    tqdm.write(f"wrote {run_dir}")
-    return run_dir, final_results
+    return run_dirs, final_results
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "experiment1.yaml"
-OUTPUT_ROOT = ROOT / "outputs"  # runs land in outputs/<dataTAG>/<stamp>__seed<seed>/
+OUTPUT_ROOT = ROOT / "outputs"  # runs land in outputs/<dataTAG>/<optimizer>/<stamp>__seed<seed>[__tag]/
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG, overrides: list[str] | None = None) -> Any:
@@ -1459,8 +1474,9 @@ def main() -> None:
     if args.dry_run:
         print(OmegaConf.to_yaml(cfg))
         return
-    run_dir, _ = run(run_args, out_dir)
-    print(f"[engine] -> {run_dir}")
+    run_dirs, _ = run(run_args, out_dir)
+    for name, opt_dir in run_dirs.items():
+        print(f"[engine] -> [{name}] {opt_dir}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,9 @@
 
 seed: [3072, 3073, 3074]
 
+run_tag: ""   # optional label appended to the run folder name (e.g. "delta0p1"),
+              # handy when re-running one optimizer at a fixed seed after a config tweak
+
 data:
   path: data/pusht_expert_train.h5
   fractions: [0.1, 0.01, 0.001]   # 10%, 0.1%, 0.01% -- run one after another

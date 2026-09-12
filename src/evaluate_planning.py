@@ -5,7 +5,7 @@ Separated from the training script so that training/tuning sweeps never pull in
 ``*_full_model.pt`` checkpoint produced by ``run_pusht_predictor_experiment.py``::
 
     uv run python src/evaluate_planning.py \
-        --checkpoint outputs/pusht_predictor_optimizer/<run>/checkpoints/adamw_full_model.pt
+        --checkpoint outputs/<dataTAG>/adamw/<run>/checkpoints/full_model.pt
 """
 
 from __future__ import annotations

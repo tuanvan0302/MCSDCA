@@ -3,14 +3,18 @@ PushT predictor optimizer, faithful to the two source papers -- NO tuning.
 
 Every knob lives in ``configs/experiment1.yaml``. This script sweeps
 ``data.fractions`` x ``seed``; each (fraction, seed) is one call to
-``run_pusht_predictor_experiment.run`` which trains all three optimizers from the
-same init and writes a fresh, uniquely named sub-folder:
+``run_pusht_predictor_experiment.run`` which trains every optimizer in
+``cfg.optimizers`` from the same init, each into its own leaf folder:
 
-    outputs/<dataTAG>/<YYYYmmdd_HHMMSS_fff>__seed<seed>/
+    outputs/<dataTAG>/<optimizer>/<YYYYmmdd_HHMMSS_fff>__seed<seed>[__tag]/
         metrics.csv   run.json
 
-Per fraction it then aggregates the final rows into ``comparison.csv`` /
-``comparison_agg.csv`` (mean/std over seeds).
+(set ``optimizers: [MCSDCA-odLD]`` and keep the seed fixed to re-tune just one
+algorithm without re-running the others.)
+
+Per fraction it then aggregates the final rows across every optimizer/seed run
+from this invocation into ``outputs/<dataTAG>/comparison_<stamp>.csv`` /
+``comparison_agg_<stamp>.csv`` (mean/std over seeds).
 
     python src/run_experiment1.py                              # full sweep from the YAML
     python src/run_experiment1.py --only-fraction 0.04         # just 4%
@@ -24,6 +28,7 @@ import argparse
 import csv
 import statistics
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -93,25 +98,30 @@ def _aggregate(fraction: float, rows: list[dict[str, Any]]) -> list[dict[str, An
     return agg
 
 
-def write_comparison(fraction: float, rows: list[dict[str, Any]], run_dirs: list[Path]) -> None:
-    """Write comparison.csv / comparison_agg.csv INTO every run folder from this
-    invocation (self-contained; a later run never overwrites an earlier one).
+def write_comparison(fraction: float, rows: list[dict[str, Any]], out_dir: Path) -> None:
+    """Write one ``comparison_<stamp>.csv`` / ``comparison_agg_<stamp>.csv`` pair
+    directly into ``out_dir`` (``outputs/<dataTAG>/``) for this invocation --
+    a fresh timestamp means a later run never overwrites an earlier comparison.
+    Cross-optimizer aggregates live one level above the per-optimizer leaf
+    folders since they summarize across all of them.
     ``rows``: one dict per (optimizer, seed) final result."""
 
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     fieldnames = ["optimizer", "seed", "data_fraction", *METRIC_KEYS, "error"]
     agg = _aggregate(fraction, rows)
     agg_fields = ["optimizer", "data_fraction", "n_seeds_ok",
                   *[f"{m}_{s}" for m in AGG_METRICS for s in ("mean", "std")]]
 
-    for rd in run_dirs:
-        with (rd / "comparison.csv").open("w", newline="", encoding="utf-8") as handle:
-            w = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(rows)
-        with (rd / "comparison_agg.csv").open("w", newline="", encoding="utf-8") as handle:
-            w = csv.DictWriter(handle, fieldnames=agg_fields, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(agg)
+    comparison_csv = out_dir / f"comparison_{stamp}.csv"
+    comparison_agg_csv = out_dir / f"comparison_agg_{stamp}.csv"
+    with comparison_csv.open("w", newline="", encoding="utf-8") as handle:
+        w = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    with comparison_agg_csv.open("w", newline="", encoding="utf-8") as handle:
+        w = csv.DictWriter(handle, fieldnames=agg_fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(agg)
 
     print(f"\n=== {data_tag(fraction)}  (mean over seeds) ===")
     print(f"{'optimizer':<14} {'n_ok':>4} {'val_mse':>11} {'rollout5':>11} {'pred/tgt var':>13} {'enc var':>10}")
@@ -121,8 +131,8 @@ def write_comparison(fraction: float, rows: list[dict[str, Any]], run_dirs: list
             return f"{v:.5f}" if isinstance(v, float) else "n/a"
         print(f"{entry['optimizer']:<14} {entry['n_seeds_ok']:>4} {fmt('val_mse_mean'):>11} {fmt('rollout_mse_5_mean'):>11} "
               f"{fmt('col_pred_target_var_ratio_mean'):>13} {fmt('col_enc_emb_var_mean_mean'):>10}")
-    for rd in run_dirs:
-        print(f"wrote {rd/'comparison.csv'}")
+    print(f"wrote {comparison_csv}")
+    print(f"wrote {comparison_agg_csv}")
 
 
 def main() -> None:
@@ -151,18 +161,18 @@ def main() -> None:
         out_dir = OUT_ROOT / data_tag(fraction)
         out_dir.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
-        run_dirs: list[Path] = []
         for seed in seeds:
             print(f"\n---- {data_tag(fraction)}  seed {seed} ----")
             run_args = build_run_args(cfg, data_fraction=fraction, seed=seed)
-            run_dir, finals = run(run_args, out_dir)
-            run_dirs.append(run_dir)
+            run_dirs, finals = run(run_args, out_dir)
             for final in finals:
                 rows.append({
                     "optimizer": final.get("optimizer"), "seed": seed, "data_fraction": fraction,
                     **{k: final.get(k) for k in METRIC_KEYS}, "error": final.get("error", ""),
                 })
-        write_comparison(fraction, rows, run_dirs)
+            for name, opt_dir in run_dirs.items():
+                print(f"  [{name}] -> {opt_dir}")
+        write_comparison(fraction, rows, out_dir)
 
     print(f"\n[experiment1] done -> {OUT_ROOT}")
 
