@@ -46,7 +46,7 @@ class MCSDCAUdLD:
         loss_sum = 0.0
         transition_count = 0
 
-        delta = cfg.ud_delta
+        delta = cfg.delta
         exp2 = math.exp(-2.0 * delta)
         exp4 = math.exp(-4.0 * delta)
         c1 = cfg.epsilon * (delta - 0.25 * exp4 - 0.75 + exp2)
@@ -59,7 +59,7 @@ class MCSDCAUdLD:
         drift_x_factor = 0.5 * delta - 0.25 * (1.0 - exp2)
         chain_length = markov_chain_length_at_step(
             cfg.langevin_steps,
-            cfg.langevin_steps_power,
+            cfg.langevin_steps_rate,
             self.outer_step,
         )
         if cfg.max_langevin_steps is not None:

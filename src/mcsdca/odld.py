@@ -50,10 +50,10 @@ class MCSDCAOdLD:
         sample_count = 0
         loss_sum = 0.0
         transition_count = 0
-        noise_scale = math.sqrt(2.0 * cfg.od_eta * cfg.epsilon)
+        noise_scale = math.sqrt(2.0 * cfg.eta * cfg.epsilon)
         chain_length = markov_chain_length_at_step(
             cfg.langevin_steps,
-            cfg.langevin_steps_power,
+            cfg.langevin_steps_rate,
             self.outer_step,
         )
         if cfg.max_langevin_steps is not None:
@@ -81,7 +81,7 @@ class MCSDCAOdLD:
             for value, base_value, grad in zip(chain, base, grads, strict=True):
                 target_grad = grad + (value - base_value) / cfg.local_entropy_time
                 noise = noise_scale * torch.randn_like(value)
-                next_chain.append((value - cfg.od_eta * target_grad + noise).detach())
+                next_chain.append((value - cfg.eta * target_grad + noise).detach())
             chain = next_chain
 
             state_index = inner_step + 1

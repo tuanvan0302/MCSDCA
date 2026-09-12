@@ -73,8 +73,8 @@ def gamma_at_step(gamma: float, gamma_power: float, outer_step: int) -> float:
     return gamma * float(outer_step + 1) ** gamma_power
 
 
-def markov_chain_length_at_step(base_length: int, length_power: float, outer_step: int) -> int:
-    return base_length + math.floor(float(outer_step + 1) ** length_power)
+def markov_chain_length_at_step(base_length: int, length_rate: float, outer_step: int) -> int:
+    return base_length + math.floor(float(outer_step + 1) * length_rate)
 
 
 def finite_or_raise(loss: torch.Tensor, name: str = "loss") -> None:

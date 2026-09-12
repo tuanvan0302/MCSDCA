@@ -99,7 +99,7 @@ def mcsdca_config_from_cfg(cfg: Any) -> MCSDCAConfig:
     m = cfg.mcsdca
     out = MCSDCAConfig(
         langevin_steps=int(m.langevin_steps),
-        langevin_steps_power=float(m.langevin_steps_power),
+        langevin_steps_rate=float(m.langevin_steps_rate),
         max_langevin_steps=(None if m.max_langevin_steps in (None, "null") else int(m.max_langevin_steps)),
         burn_in=int(m.burn_in),
         local_entropy_time=float(m.local_entropy_time),
@@ -107,8 +107,8 @@ def mcsdca_config_from_cfg(cfg: Any) -> MCSDCAConfig:
         gamma_power=float(m.gamma_power),
         beta0=(None if m.beta0 in (None, "null") else float(m.beta0)),
         epsilon=float(m.epsilon),
-        od_eta=float(m.od_eta),
-        ud_delta=float(m.ud_delta),
+        eta=float(m.eta),
+        delta=float(m.delta),
     )
     out.validate()
     return out

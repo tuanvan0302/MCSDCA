@@ -86,8 +86,8 @@ loss:
     num_proj: 1024
 
 mcsdca:                      # = MCSDCAConfig.paper() -- keep in sync with src/mcsdca/config.py
-  langevin_steps: 20         # n_k = langevin_steps + floor((k+1)^langevin_steps_power)
-  langevin_steps_power: 0.1
+  langevin_steps: 20         # n_k = langevin_steps + floor((k+1) * langevin_steps_rate)
+  langevin_steps_rate: 0.1
   max_langevin_steps: null   # no cap (per paper)
   burn_in: 10                # discard the first 10 chain states
   local_entropy_time: 1.0e4  # t  (1/t = 1e-4)
@@ -95,8 +95,8 @@ mcsdca:                      # = MCSDCAConfig.paper() -- keep in sync with src/m
   gamma_power: 0.1
   beta0: null                # unset => gamma schedule above drives gamma_k
   epsilon: 1.0e-8            # Langevin temperature / PDE viscosity
-  od_eta: 1.0e-3             # overdamped Langevin step size
-  ud_delta: 1.0e-3           # underdamped Langevin step size
+  eta: 1.0e-3                # overdamped Langevin step size (odLD only)
+  delta: 0.1                 # underdamped Langevin discretization coefficient (udLD only)
 
 eval:
   batch_size: 8
