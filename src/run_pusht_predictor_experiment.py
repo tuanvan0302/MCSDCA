@@ -317,18 +317,9 @@ class PushTHDF5Sampler:
         self.seed = seed
         self.raw_span = frameskip * max_seq_len
 
-        # One long-lived read handle (a bigger chunk cache than the default 1 MB
-        # so repeated slab reads during cache warm-up stay in memory). The
-        # ``action`` dataset is tiny (~19 MB) so we pull it fully into RAM once;
-        # every per-window action slice is then a pure numpy view.
-        self._h5 = self.h5py.File(path, "r", rdcc_nbytes=256 * 1024 * 1024)
-        self._pixels_ds = self._h5["pixels"]
-        self._mtime = int(Path(path).stat().st_mtime)
-        self.ep_len = np.asarray(self._h5["ep_len"][:])
-        self.ep_offset = np.asarray(self._h5["ep_offset"][:])
-        self.pixel_shape = tuple(self._h5["pixels"].shape)
-        self.action_shape = tuple(self._h5["action"].shape)
-        self._actions_all = np.asarray(self._h5["action"][:], dtype=np.float32)
+        self._h5 = None
+        self._pixels_ds = None
+        self._load_or_fetch_metadata()
 
         self.valid_eps = np.flatnonzero(self.ep_len >= self.raw_span)
         if len(self.valid_eps) < 2:
@@ -338,6 +329,78 @@ class PushTHDF5Sampler:
         self.train_eps = np.sort(shuffled[:split_index])
         self.val_eps = np.sort(shuffled[split_index:])
         self.action_mean, self.action_std = self._estimate_action_block_stats(action_stats_samples)
+
+    def _metadata_cache_path(self) -> Path:
+        # Fixed default location, independent of --set cache.memmap_dir -- this
+        # sidecar is tiny (~19 MB, dominated by the action array) and tied to
+        # the dataset itself, not to any particular resident-cache tier.
+        return Path(self.path).parent / ".framecache" / "dataset_meta.npz"
+
+    def _load_or_fetch_metadata(self) -> None:
+        """Populate ep_len/ep_offset/pixel_shape/action_shape/_actions_all/_mtime.
+
+        Prefers a small persisted sidecar (``dataset_meta.npz``) so that once a
+        PNG/memmap pixel cache is fully built, the (much bigger) original
+        ``--data`` file is no longer needed at all -- safe to delete it to save
+        disk. Falls back to the real HDF5 file when no sidecar exists yet, and
+        opportunistically writes one so the next run can skip it."""
+
+        meta_path = self._metadata_cache_path()
+        if meta_path.exists():
+            data = np.load(meta_path, allow_pickle=False)
+            self._mtime = int(data["mtime"])
+            self.ep_len = data["ep_len"]
+            self.ep_offset = data["ep_offset"]
+            self.pixel_shape = tuple(int(v) for v in data["pixel_shape"])
+            self.action_shape = tuple(int(v) for v in data["action_shape"])
+            self._actions_all = data["actions_all"].astype(np.float32)
+            return
+
+        if not Path(self.path).exists():
+            raise FileNotFoundError(
+                f"Source file missing ({self.path}) and no metadata cache at {meta_path}. "
+                "Episode lengths/offsets and actions live only in the original --data file "
+                "the first time; restore it once so this sidecar can be written, then it is "
+                "safe to delete again."
+            )
+
+        # One long-lived read handle (a bigger chunk cache than the default 1 MB
+        # so repeated slab reads during cache warm-up stay in memory). The
+        # ``action`` dataset is tiny (~19 MB) so we pull it fully into RAM once;
+        # every per-window action slice is then a pure numpy view.
+        self._h5 = self.h5py.File(self.path, "r", rdcc_nbytes=256 * 1024 * 1024)
+        self._pixels_ds = self._h5["pixels"]
+        self._mtime = int(Path(self.path).stat().st_mtime)
+        self.ep_len = np.asarray(self._h5["ep_len"][:])
+        self.ep_offset = np.asarray(self._h5["ep_offset"][:])
+        self.pixel_shape = tuple(self._h5["pixels"].shape)
+        self.action_shape = tuple(self._h5["action"].shape)
+        self._actions_all = np.asarray(self._h5["action"][:], dtype=np.float32)
+
+        try:
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                meta_path, mtime=self._mtime, ep_len=self.ep_len, ep_offset=self.ep_offset,
+                pixel_shape=np.asarray(self.pixel_shape), action_shape=np.asarray(self.action_shape),
+                actions_all=self._actions_all,
+            )
+        except OSError:
+            pass  # best effort -- a full disk here shouldn't block training
+
+    @property
+    def pixels_ds(self) -> Any:
+        """The raw HDF5 pixel dataset -- only needed for streaming, or to build
+        a cache tier that isn't already on disk. Raises a clear error instead of
+        a confusing ``NoneType`` crash when the source file was deleted after
+        every pixel cache was already built."""
+
+        if self._pixels_ds is None:
+            raise RuntimeError(
+                f"Need the original HDF5 pixels ({self.path}) for this operation (no existing "
+                "PNG/memmap cache covers it), but the source file is missing and only the "
+                "metadata sidecar was found. Restore the --data file to build this selection."
+            )
+        return self._pixels_ds
 
     def _episode_pool(self, split: str) -> np.ndarray:
         if split == "train":
@@ -421,7 +484,7 @@ class PushTHDF5Sampler:
         return torch.nan_to_num(act.flatten(start_dim=2), 0.0)
 
     def _load_windows(self, windows: list[tuple[int, int, int, int]], seq_len: int):
-        pixels_ds = self._pixels_ds
+        pixels_ds = self.pixels_ds
         pixels: list[np.ndarray] = []
         action_starts: list[int] = []
         rows: list[dict[str, int]] = []
@@ -475,7 +538,7 @@ class PushTHDF5Sampler:
         for lo_pos, hi_pos, first in self._contiguous_runs(uniq):
             for sub in range(lo_pos, hi_pos, read_chunk):
                 sub_hi = min(sub + read_chunk, hi_pos)
-                slab = self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
+                slab = self.pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)]  # [n, H, W, C] uint8
                 chw = np.ascontiguousarray(np.moveaxis(slab, 3, 1))  # [n, C, H, W]
                 dst[sub:sub_hi] = torch.from_numpy(chw) if is_tensor else chw
 
@@ -519,6 +582,59 @@ class PushTHDF5Sampler:
             backing=frames_device.type,
         )
 
+    def _pixel_cache_tag(self, split: str, seq_len: int, window_ids: np.ndarray) -> tuple[np.ndarray, str]:
+        """``(uniq, tag)`` shared by every disk cache tier (memmap, png) and by
+        ``existing_cache_gb`` -- same content hash, so tag collisions/misses
+        stay consistent across tiers and across a size-only existence check."""
+
+        windows = self._resolve_windows(split, seq_len, window_ids)
+        frame_ids = self._window_frame_ids(windows, seq_len)
+        uniq = np.unique(frame_ids)
+        _, height, width, channels = self.pixel_shape
+        tag = hashlib.sha1(
+            repr((str(self.path), self._mtime, split, seq_len, (int(uniq.size), channels, height, width),
+                  int(uniq[0]), int(uniq[-1]), int(len(window_ids)))).encode()
+        ).hexdigest()[:16]
+        return uniq, tag
+
+    def existing_cache_gb(self, split: str, seq_len: int, window_ids: np.ndarray, cache_dir: Path) -> dict[str, float]:
+        """Which disk cache tiers already have a file matching this EXACT
+        selection sitting in ``cache_dir``, keyed by tier name -> size in GB.
+
+        Lets ``resolve_cache_placement`` tell "already built, just reuse it"
+        apart from "need to write N new GB" -- a free-disk-space check against
+        the SIZE OF A REBUILD is wrong once a matching cache already exists,
+        since reusing it needs zero new bytes (this is what previously made a
+        fully-built PNG cache get rejected once it ate into the free-space
+        margin that same build had used)."""
+
+        uniq, tag = self._pixel_cache_tag(split, seq_len, window_ids)
+        _, height, width, channels = self.pixel_shape
+        cache_dir = Path(cache_dir)
+        found: dict[str, float] = {}
+
+        dat = cache_dir / f"frames_{split}_{tag}.dat"
+        meta = dat.with_suffix(".json")
+        want_mm = {"shape": [int(uniq.size), channels, height, width], "dtype": "uint8"}
+        if dat.exists() and meta.exists():
+            try:
+                if json.loads(meta.read_text(encoding="utf-8")) == want_mm:
+                    found["memmap"] = dat.stat().st_size / 1e9
+            except (OSError, ValueError):
+                pass
+
+        blob = cache_dir / f"frames_{split}_{tag}.png.blob"
+        idx = blob.with_suffix(".idx.npy")
+        pmeta = blob.with_suffix(".json")
+        if blob.exists() and idx.exists() and pmeta.exists():
+            try:
+                if json.loads(pmeta.read_text(encoding="utf-8")).get("count") == int(uniq.size):
+                    found["png"] = blob.stat().st_size / 1e9
+            except (OSError, ValueError):
+                pass
+
+        return found
+
     def materialize_windows_memmap(
         self,
         split: str,
@@ -533,16 +649,12 @@ class PushTHDF5Sampler:
         RAM after the first epoch; the decode pass runs once and is reused across
         sweep points / reruns via a content hash."""
 
+        uniq, tag = self._pixel_cache_tag(split, seq_len, window_ids)
         windows = self._resolve_windows(split, seq_len, window_ids)
         frame_ids = self._window_frame_ids(windows, seq_len)
-        uniq = np.unique(frame_ids)
         _, height, width, channels = self.pixel_shape
         shape = (int(uniq.size), channels, height, width)
 
-        tag = hashlib.sha1(
-            repr((str(self.path), self._mtime, split, seq_len, shape,
-                  int(uniq[0]), int(uniq[-1]), int(len(window_ids)))).encode()
-        ).hexdigest()[:16]
         Path(memmap_dir).mkdir(parents=True, exist_ok=True)
         dat = Path(memmap_dir) / f"frames_{split}_{tag}.dat"
         meta = dat.with_suffix(".json")
@@ -602,7 +714,7 @@ class PushTHDF5Sampler:
             for lo_pos, hi_pos, first in self._contiguous_runs(uniq):
                 for sub in range(lo_pos, hi_pos, read_chunk):
                     sub_hi = min(sub + read_chunk, hi_pos)
-                    slab = np.asarray(self._pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)])
+                    slab = np.asarray(self.pixels_ds[first + (sub - lo_pos) : first + (sub_hi - lo_pos)])
                     for blob in pool.map(encode_one, slab):  # pool.map preserves input order
                         index[pos] = (offset, len(blob))
                         out.write(blob)
@@ -639,16 +751,12 @@ class PushTHDF5Sampler:
         reruns via the same content-hash scheme; see ``_build_png_blob``."""
 
         require_pillow()
+        uniq, tag = self._pixel_cache_tag(split, seq_len, window_ids)
         windows = self._resolve_windows(split, seq_len, window_ids)
         frame_ids = self._window_frame_ids(windows, seq_len)
-        uniq = np.unique(frame_ids)
         _, height, width, channels = self.pixel_shape
         n_unique = int(uniq.size)
 
-        tag = hashlib.sha1(
-            repr((str(self.path), self._mtime, split, seq_len, (n_unique, channels, height, width),
-                  int(uniq[0]), int(uniq[-1]), int(len(window_ids)))).encode()
-        ).hexdigest()[:16]
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         blob_path = Path(cache_dir) / f"frames_{split}_{tag}.png.blob"
         idx_path = blob_path.with_suffix(".idx.npy")
@@ -878,6 +986,7 @@ def resolve_cache_placement(
     disk_budget_gb: float,
     memmap_dir: Path,
     gpu_reserve_gb: float = 14.0,
+    existing_cache_gb: dict[str, float] | None = None,
 ) -> tuple[bool, torch.device, str, str]:
     """Decide where the resident training cache lives.
 
@@ -892,12 +1001,22 @@ def resolve_cache_placement(
     doesn't fit -- decoding it costs a bit of CPU per batch, so memmap is
     preferred whenever both fit.
 
+    ``existing_cache_gb`` (from ``PushTHDF5Sampler.existing_cache_gb``) short-
+    circuits the disk-space check for a tier whose file is ALREADY built and
+    matches this exact selection: reusing it needs zero new bytes, so it must
+    not be rejected by a free-disk-space estimate sized for a fresh REBUILD --
+    that estimate naturally shrinks once the existing cache itself has eaten
+    into free disk space, which used to make an already-finished cache get
+    rejected right after it finished building.
+
     A GPU-resident cache competes with the model + activations + (for MCSDCA)
     the retained-sample chain, so it is only chosen when ``est_gb`` fits under
     both ``gpu_budget_gb`` and ``free - gpu_reserve_gb`` (headroom left for
     training). Otherwise it drops to host RAM / disk, which is nearly free once
     prefetch hides the transfer.
     """
+
+    existing_cache_gb = existing_cache_gb or {}
 
     _, height, width, channels = pixel_shape
     est_gb = est_frames * height * width * channels / 1e9
@@ -959,6 +1078,11 @@ def resolve_cache_placement(
         disk_cap = min(disk_budget_gb, 0.9 * free_disk_gb)
 
     if mode in ("auto", "memmap"):
+        if "memmap" in existing_cache_gb:
+            return True, cpu, "memmap", (
+                f"disk memmap: found existing cache (~{existing_cache_gb['memmap']:.1f} GB in "
+                f"{memmap_dir}), reuse"
+            )
         if est_gb <= disk_cap:
             return True, cpu, "memmap", (
                 f"disk memmap (~{est_gb:.1f} GB in {memmap_dir}, page-cached; "
@@ -973,6 +1097,11 @@ def resolve_cache_placement(
         # compressed PNG blob before giving up to unprefetched streaming.
 
     if mode in ("auto", "png"):
+        if "png" in existing_cache_gb:
+            return True, cpu, "png", (
+                f"disk PNG cache: found existing cache (~{existing_cache_gb['png']:.1f} GB in "
+                f"{memmap_dir}), reuse"
+            )
         est_png_gb = est_gb / PNG_COMPRESSION_RATIO_ESTIMATE
         if est_png_gb <= disk_cap:
             return True, cpu, "png", (
@@ -1495,10 +1624,12 @@ def run(args: SimpleNamespace, output_dir: Path) -> tuple[dict[str, Path], list[
     # ---- resident training-window cache (plans 1-4): decode once, reuse ---- #
     memmap_dir = Path(args.memmap_dir).resolve() if args.memmap_dir else (data_path.parent / ".framecache")
     est_frames = sampler.count_unique_frames("train", training_seq_len, train_window_ids)
+    existing = sampler.existing_cache_gb("train", training_seq_len, train_window_ids, memmap_dir)
     use_cache, frames_device, backing, cache_reason = resolve_cache_placement(
         args.window_cache, est_frames, sampler.pixel_shape, device,
         args.cache_max_gb, args.cache_ram_gb, args.cache_disk_gb, memmap_dir,
         gpu_reserve_gb=getattr(args, "cache_gpu_reserve_gb", 14.0),
+        existing_cache_gb=existing,
     )
     cache_bytes = 0
     prefetch = 0
